@@ -22,7 +22,7 @@ other.
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.1.1
+zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.2.0
 ```
 
 ```zig
@@ -36,9 +36,9 @@ published at <https://guanchzhou.github.io/zig-hilbert/>.
 
 ## Library
 
-These snippets come from [examples/curves.zig](examples/curves.zig) and
-[examples/markers.zig](examples/markers.zig), which `zig build test`
-compiles and runs.
+These snippets come from [examples/curves.zig](examples/curves.zig),
+[examples/markers.zig](examples/markers.zig), and
+[examples/s2.zig](examples/s2.zig), which `zig build test` compiles and runs.
 
 ```zig
 // 2D, order known at compile time: no checks, no branches.
@@ -70,8 +70,45 @@ or to fill space in curve order.
 
 `hilbert.batch` also has `encode2Checked` / `decode2Checked` (runtime order,
 validated inside the parallel kernel), `encode2Points` / `decode2Points`
-(interleaved `[]Point2`), `encode` / `decode` for n-D points, and
-`decodeRange` split across threads.
+(interleaved `[]Point2`), `decode2PointsChecked` (runtime order), `encode`
+/ `decode` for n-D points, and `decodeRange` split across threads.
+`decodeRange` returns `error.IndexOutOfRange` when the walk would leave
+the space.
+
+### Geographic cell ids
+
+`hilbert.s2` produces the same cell ids as Google's S2 library, so a column
+of these ids sorts and queries the way BigQuery and Maps already do.
+
+```zig
+const cell = try hilbert.s2.fromLatLng(37.4, -122.1); // level-30 leaf
+const coarse = cell.parent(12);
+var buf: [16]u8 = undefined;
+const token = coarse.token(&buf); // hex, no trailing zeros
+
+var ranges: [9]hilbert.s2.Range = undefined;
+const got = try hilbert.s2.covering(37.4, -122.1, 1000, &ranges);
+// got[i].lo .. got[i].hi are inclusive id bounds for a BETWEEN query
+```
+
+`covering` picks a level whose cells are at least twice as wide as the
+radius and returns the point's cell plus its neighbours, merged into at
+most 9 ranges. A radius of a quarter of the Earth's circumference or more
+returns one range covering the whole sphere. The ids use S2's quadratic
+projection and the same Hilbert orientation as `encode2`, swapped on odd
+cube faces.
+
+### Compatibility
+
+Within a major version, these stay bit-identical:
+
+- 2D and n-D curve indices
+- marker text (`hk1`) and the key bytes behind it
+- S2 cell ids
+
+A change to any of them is a new major version, and a change to the marker
+projection is a new marker prefix. The golden files
+([test/markers.jsonl](test/markers.jsonl) and the S2 tests) are the check.
 
 The last argument of every batch function (and of `Space.keys`) is either a
 thread count or a `std.Io`. A thread count uses that many OS threads (0
@@ -384,9 +421,10 @@ walks the first 65,536 indices with their `decode_range` and our
 - **CLI limits.** The CLI limits line length, bounds memory by processing
   blocks of rows, and reports errors on stderr with exit code 1.
 - **Testing.** Tests run in Debug, ReleaseSafe, and ReleaseFast. The checked
-  APIs and the marker parser have fuzz targets, the n-D curve is checked
-  against Skilling's original branching algorithm, and the CLI has its own
-  test suite.
+  APIs and the marker parser have fuzz targets, which replay
+  `src/fuzz-corpus/` on every run. The n-D curve is checked against
+  Skilling's original branching algorithm, and the CLI has its own test
+  suite.
 - **CI supply chain.** CI downloads Zig from ziglang.org with a pinned
   sha256 and pins every action to a commit SHA.
 

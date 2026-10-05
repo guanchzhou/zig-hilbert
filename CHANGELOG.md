@@ -1,12 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-05
 
 - `decodeRange` and `decodeRangeChecked` decode consecutive n-D indices
   incrementally: 2-4 ns per point, 17-26x faster than decoding each index.
-  `batch.decodeRange` splits a walk across threads or a `std.Io`.
+  `batch.decodeRange` splits a walk across threads or a `std.Io`, and
+  returns `error.IndexOutOfRange` when the walk would leave the space.
+- `batch.decode2PointsChecked` decodes interleaved 2D points at a runtime
+  order, validating indices inside the parallel kernel.
+- S2 cell ids (`hilbert.s2`): latitude and longitude become the same u64
+  cell ids as Google's S2 library, including parent, children, edge
+  neighbours, hex tokens, and a cap covering that returns merged id ranges.
 - `bench/compare/run.sh` compares n-D encode, decode, and consecutive
   decode with HilbertCurveCompact.
+- Fuzz targets replay the corpus in `src/fuzz-corpus/` on every `zig build test`.
 
 ## 0.1.1 - 2026-10-05
 

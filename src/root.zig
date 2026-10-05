@@ -1,6 +1,6 @@
 //! Hilbert curves for Zig 0.17: a table-driven 2D curve, an n-dimensional
-//! curve, parallel batches, and sortable knowledge-marker keys built from
-//! embeddings.
+//! curve, parallel batches, sortable knowledge-marker keys built from
+//! embeddings, and S2 cell ids for latitude and longitude.
 //!
 //! ```zig
 //! const hilbert = @import("hilbert");
@@ -17,6 +17,7 @@ pub const batch = @import("batch.zig");
 pub const marker = @import("marker.zig");
 pub const parallel = @import("parallel.zig");
 pub const reference = @import("reference.zig");
+pub const s2 = @import("s2.zig");
 
 pub const Point2 = curve2d.Point;
 
@@ -49,6 +50,7 @@ test {
     _ = parallel;
     _ = batch;
     _ = marker;
+    _ = s2;
     _ = @import("fuzz.zig");
 }
 

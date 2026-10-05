@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(golden).step);
 
-    for ([_][]const u8{ "curves", "markers" }) |name| {
+    for ([_][]const u8{ "curves", "markers", "s2" }) |name| {
         const example = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
