@@ -143,6 +143,34 @@ pub fn decode2Points(comptime bits: u6, indices: []const u64, out: []curve2d.Poi
     try parallel.run(exec, out.len, min, &ctx, Ctx.run);
 }
 
+/// `decode2Points` with a runtime order and validated indices. On error
+/// `out` is unspecified.
+pub fn decode2PointsChecked(bits: u6, indices: []const u64, out: []curve2d.Point, exec: anytype) Result(@TypeOf(exec), curve2d.Error) {
+    if (indices.len != out.len) return error.LengthMismatch;
+    if (bits < 1 or bits > curve2d.max_bits) return error.OrderOutOfRange;
+    switch (bits) {
+        inline 1...curve2d.max_bits => |b| {
+            const Ctx = struct {
+                in: []const u64,
+                out: []curve2d.Point,
+                bad: std.atomic.Value(bool) = .init(false),
+                fn run(c: *@This(), start: usize, end: usize) void {
+                    if (b < 32) {
+                        var any: u64 = 0;
+                        for (c.in[start..end]) |h| any |= h;
+                        if (any >> (2 * b) != 0) return c.bad.store(true, .monotonic);
+                    }
+                    for (c.in[start..end], c.out[start..end]) |h, *o| o.* = curve2d.decode(b, h);
+                }
+            };
+            var ctx: Ctx = .{ .in = indices, .out = out };
+            try parallel.run(exec, out.len, min, &ctx, Ctx.run);
+            if (ctx.bad.load(.monotonic)) return error.IndexOutOfRange;
+        },
+        else => unreachable,
+    }
+}
+
 /// n-D encode of every point. Precondition: coordinates are `< 2^bits`.
 pub fn encode(comptime dims: u8, comptime bits: u8, points: []const [dims]u32, out: []curvend.Index(dims, bits), exec: anytype) Result(@TypeOf(exec), error{}) {
     if (points.len != out.len) return error.LengthMismatch;
@@ -172,10 +200,11 @@ pub fn decode(comptime dims: u8, comptime bits: u8, indices: []const curvend.Ind
 }
 
 /// `curvend.decodeRange` split across `exec`: each part restarts the walk
-/// at its own first index.
-pub fn decodeRange(comptime dims: u8, comptime bits: u8, start: curvend.Index(dims, bits), out: [][dims]u32, exec: anytype) Result(@TypeOf(exec), error{}) {
+/// at its own first index. Returns `error.IndexOutOfRange` when the last
+/// index is outside the space.
+pub fn decodeRange(comptime dims: u8, comptime bits: u8, start: curvend.Index(dims, bits), out: [][dims]u32, exec: anytype) Result(@TypeOf(exec), curvend.Error) {
     if (out.len == 0) return;
-    std.debug.assert(out.len - 1 <= std.math.maxInt(curvend.Index(dims, bits)) - start);
+    if (@as(u128, out.len - 1) > std.math.maxInt(curvend.Index(dims, bits)) - @as(u128, start)) return error.IndexOutOfRange;
     const Ctx = struct {
         start: curvend.Index(dims, bits),
         out: [][dims]u32,
@@ -265,4 +294,25 @@ test "n-D batch matches scalar encode and round-trips" {
     const start: u63 = 987654321;
     try decodeRange(3, 21, start, walk, 4);
     for (walk, 0..) |p, i| try std.testing.expectEqual(curvend.decode(3, 21, start + @as(u63, @intCast(i))), p);
+    var tiny: [3][1]u32 = undefined;
+    try std.testing.expectError(error.IndexOutOfRange, decodeRange(1, 1, @as(u1, 0), &tiny, 1));
+}
+
+test "checked point decode matches the scalar curve" {
+    const gpa = std.testing.allocator;
+    const n = 1000;
+    const pts = try gpa.alloc(curve2d.Point, n);
+    defer gpa.free(pts);
+    const hs = try gpa.alloc(u64, n);
+    defer gpa.free(hs);
+    var prng = std.Random.DefaultPrng.init(9);
+    for (pts) |*p| p.* = .{ .x = prng.random().int(u20), .y = prng.random().int(u20) };
+    try encode2Points(20, pts, hs, 1);
+    const back = try gpa.alloc(curve2d.Point, n);
+    defer gpa.free(back);
+    try decode2PointsChecked(20, hs, back, std.testing.io);
+    try std.testing.expectEqualSlices(curve2d.Point, pts, back);
+    hs[3] = 1 << 40;
+    try std.testing.expectError(error.IndexOutOfRange, decode2PointsChecked(20, hs, back, 0));
+    try std.testing.expectError(error.OrderOutOfRange, decode2PointsChecked(0, hs, back, 0));
 }
