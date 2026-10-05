@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `decodeRange` and `decodeRangeChecked` decode consecutive n-D indices
+  incrementally: 2-4 ns per point, 17-26x faster than decoding each index.
+  `batch.decodeRange` splits a walk across threads or a `std.Io`.
+- `bench/compare/run.sh` compares n-D encode, decode, and consecutive
+  decode with HilbertCurveCompact.
+
 ## 0.1.1 - 2026-10-05
 
 - Fix: the package omitted `test/` and `examples/`, which `build.zig`

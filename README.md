@@ -57,11 +57,21 @@ try hilbert.batch.decode2(32, out, xs, ys, 0);
 const k = hilbert.encode(3, 8, .{ 10, 200, 37 });
 const pt = hilbert.decode(3, 8, k); // [3]u32
 const k2 = try hilbert.encodeChecked(3, 8, &.{ 10, 200, 37 }); // runtime shape, u128
+
+// Walk the curve: consecutive indices, decoded incrementally.
+var walk: [256][3]u32 = undefined;
+hilbert.decodeRange(3, 8, 1000, &walk); // walk[i] = decode(3, 8, 1000 + i)
 ```
+
+`decodeRange` (and `decodeRangeChecked` for runtime shapes) reuses the work
+of every level above the highest digit that changed, so walking the curve
+costs 2-4 ns per point instead of a full decode. Use it to scan a key range
+or to fill space in curve order.
 
 `hilbert.batch` also has `encode2Checked` / `decode2Checked` (runtime order,
 validated inside the parallel kernel), `encode2Points` / `decode2Points`
-(interleaved `[]Point2`), and `encode` / `decode` for n-D points.
+(interleaved `[]Point2`), `encode` / `decode` for n-D points, and
+`decodeRange` split across threads.
 
 The last argument of every batch function (and of `Space.keys`) is either a
 thread count or a `std.Io`. A thread count uses that many OS threads (0
@@ -226,9 +236,13 @@ points, median of 9 runs (`zig build bench`):
 | 2D decode, order 32, table | 3.24 | 8.6x |
 | 2D encode, order 16, table | 1.01 | 10.0x |
 | 2D encode, order 16, batch on all cores | 0.18 | 57x |
-| n-D encode, 3 dims x 21 bits | 52 | |
-| n-D encode, 8 dims x 8 bits | 57 | |
-| n-D encode, 16 dims x 8 bits (128-bit key) | 126 | |
+| n-D encode, 3 dims x 21 bits | 51 | |
+| n-D encode, 8 dims x 8 bits | 55 | |
+| n-D encode, 16 dims x 8 bits (128-bit key) | 122 | |
+| n-D decode, 3 dims x 21 bits, one index at a time | 47 | |
+| n-D `decodeRange`, 3 dims x 21 bits | 2.4 | 20x vs decode |
+| n-D `decodeRange`, 8 dims x 8 bits | 2.9 | 17x vs decode |
+| n-D `decodeRange`, 16 dims x 8 bits | 3.7 | 26x vs decode |
 | Marker key, 768-dim embedding, 1 core | 212 | |
 | Marker key, 768-dim embedding, all cores | 38 | |
 
@@ -252,6 +266,12 @@ Why it is fast:
   shift-and-mask spreading, which takes about `5 * dims` operations instead
   of one step per index bit. A chain of dependent operations through the
   first axis limits further speedup.
+- **Walking the curve.** Skilling's decode works from the lowest level up,
+  but each level's step permutes and complements the axes of every lower
+  level the same way, based only on that level's bits. `decodeRange`
+  composes those maps from the top down, so the next index only redoes the
+  levels below the highest digit that changed, which is one level most of
+  the time.
 - **Markers.** The projection uses fused multiply-adds, which is exact here
   because every coefficient is -1, 0, or 1. Two rows share each coefficient
   load. The final `exp` and quantization run on all axes at once.
@@ -298,6 +318,32 @@ checksums), so they compute the same curve.
   the same speed (97.6 ns at order 32). It does much more than this library:
   unequal axis extents, other Gray-code families, and arbitrarily wide
   indices. That generality is what the extra time pays for.
+
+#### n-D against HilbertCurveCompact
+
+`run.sh` also runs both libraries on the same 65,536 random n-D points, and
+walks the first 65,536 indices with their `decode_range` and our
+`decodeRange` (ns/point, one core):
+
+| Space | Encode, theirs | Encode, ours | Decode, theirs | Decode, ours | Consecutive, theirs | Consecutive, ours |
+|---|---:|---:|---:|---:|---:|---:|
+| 3 x 21 bits | 67.6 | **52.2** | 62.8 | **48.2** | 4.4 | **2.4** |
+| 4 x 16 bits | **53.9** | 55.3 | 49.6 | **47.9** | 4.7 | **2.2** |
+| 8 x 8 bits | 76.4 | **57.1** | **47.2** | 49.7 | 12.8 | **2.8** |
+| 4 x 32 bits | **115.4** | 124.0 | **108.9** | 111.7 | 4.6 | **3.1** |
+| 16 x 8 bits | **103.0** | 124.9 | **60.1** | 103.3 | 8.0 | **3.5** |
+
+- **Different curves.** In n-D the two libraries trace different Hilbert
+  curves: theirs is built from a rotated reflected Gray code, ours is
+  Skilling's. Their indices agreed with ours on 0 of 10,000 random points.
+  Both curves are valid. Each library's own round trip is checked.
+- **Where we lose.** HilbertCurveCompact is faster at 16 dimensions and
+  slightly faster at 4 x 32 bits. Its per-level transition tables pay off
+  there, while our transform scales with `dims * bits`.
+- **Not compared.** Their tests and benchmarks also cover features this
+  library does not have: unequal axis sizes, indices wider than 128 bits,
+  more than 32 bits per axis, other Gray-code families, box fills
+  (`encode_region` and neighbour traversals), and `compare_points`.
 
 `run.sh` pins every compared library: a crate version with `Cargo.lock` and
 `--locked`, a git commit, and a sha256 for the downloaded file.
