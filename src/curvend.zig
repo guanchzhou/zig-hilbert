@@ -190,6 +190,130 @@ pub fn decodeChecked(dims: u8, bits: u8, index: u128, out: []u32) Error!void {
     }
 }
 
+/// Decodes `out.len` consecutive indices `start, start + 1, ...`.
+/// Precondition: the last index is inside the space.
+///
+/// Skilling's decode works from the lowest level up, and the step for each
+/// level changes every lower level the same way: it permutes and
+/// complements the axes, based only on that level's Gray-decoded bits.
+/// Composing those maps from the top down instead means the next index
+/// reuses every level above the highest digit that changed, which is one
+/// level most of the time.
+pub fn decodeRange(comptime dims: u8, comptime bits: u8, start: Index(dims, bits), out: [][dims]u32) void {
+    comptime validSpace(dims, bits) catch @compileError("unsupported space");
+    if (out.len == 0) return;
+    std.debug.assert(out.len - 1 <= std.math.maxInt(Index(dims, bits)) - start);
+    walk(dims, Word(dims, bits), bits, start, out);
+}
+
+/// Runtime-space `decodeRange` that validates its arguments. `out` holds
+/// `dims` coordinates per point.
+pub fn decodeRangeChecked(dims: u8, bits: u8, start: u128, out: []u32) Error!void {
+    try validSpace(dims, bits);
+    if (out.len % dims != 0) return error.DimensionsOutOfRange;
+    const count = out.len / dims;
+    if (count == 0) return;
+    const total: u16 = @as(u16, dims) * bits;
+    const max: u128 = if (total == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(total)) - 1;
+    if (start > max or count - 1 > max - start) return error.IndexOutOfRange;
+    @setEvalBranchQuota(100_000);
+    switch (dims) {
+        inline 1...max_dims => |d| {
+            const points: [][d]u32 = @as([*][d]u32, @ptrCast(out.ptr))[0..count];
+            if (total <= 64) walk(d, u64, bits, @intCast(start), points) else walk(d, u128, bits, start, points);
+        },
+        else => unreachable,
+    }
+}
+
+/// `v ↦ w` with `w[j] = v[p[j]] ^ f[j]` on one level's bits (bit `j` of a
+/// column is axis `j`).
+fn ColumnMap(comptime dims: u8) type {
+    return struct {
+        p: [dims]u8,
+        f: u32,
+
+        const identity: @This() = .{ .p = blk: {
+            var p: [dims]u8 = undefined;
+            for (&p, 0..) |*v, i| v.* = i;
+            break :blk p;
+        }, .f = 0 };
+
+        inline fn apply(m: @This(), v: u32) u32 {
+            var w: u32 = 0;
+            inline for (0..dims) |j| w |= ((v >> @intCast(m.p[j])) & 1) << j;
+            return w ^ m.f;
+        }
+
+        /// Skilling's step for one level with Gray-decoded column `g`: for
+        /// axis `i` from the last down, complement axis 0 if bit `i` of `g`
+        /// is set, else swap axes 0 and `i`.
+        inline fn level(g: u32) @This() {
+            var m = identity;
+            inline for (0..dims) |r| {
+                const i = dims - 1 - r;
+                if ((g >> i) & 1 == 1) {
+                    m.f ^= 1;
+                } else if (i != 0) {
+                    std.mem.swap(u8, &m.p[0], &m.p[i]);
+                    const t = ((m.f >> i) ^ m.f) & 1;
+                    m.f ^= t | (t << i);
+                }
+            }
+            return m;
+        }
+
+        /// `s` after `a`: `(s ∘ a)(v) = s(a(v))`.
+        inline fn then(a: @This(), s: @This()) @This() {
+            var m: @This() = undefined;
+            m.f = s.f;
+            inline for (0..dims) |j| {
+                m.p[j] = a.p[s.p[j]];
+                m.f ^= ((a.f >> @intCast(s.p[j])) & 1) << j;
+            }
+            return m;
+        }
+    };
+}
+
+fn walk(comptime dims: u8, comptime W: type, bits: u8, start: W, out: [][dims]u32) void {
+    const Map = ColumnMap(dims);
+    const digit_mask: W = if (dims == @bitSizeOf(W)) std.math.maxInt(W) else (@as(W, 1) << dims) - 1;
+    const Shift = std.math.Log2Int(W);
+    // maps[L] composes the steps of every level above L.
+    var maps: [max_bits]Map = undefined;
+    var x: [dims]u32 = @splat(0);
+    var h = start;
+    maps[bits - 1] = Map.identity;
+    refill(dims, W, bits, h, bits - 1, &maps, &x, digit_mask, Shift);
+    out[0] = x;
+    for (out[1..]) |*o| {
+        const prev = h;
+        h +%= 1;
+        const top: u8 = @intCast((@bitSizeOf(W) - 1 - @clz(prev ^ h)) / dims);
+        refill(dims, W, bits, h, @min(top, bits - 1), &maps, &x, digit_mask, Shift);
+        o.* = x;
+    }
+}
+
+/// Recomputes levels `top` down to 0 of `x` for index `h`, using
+/// `maps[top]` and rewriting `maps` below it.
+inline fn refill(comptime dims: u8, comptime W: type, bits: u8, h: W, top: u8, maps: []ColumnMap(dims), x: *[dims]u32, digit_mask: W, comptime Shift: type) void {
+    const keep: u32 = if (top == 31) 0 else ~((@as(u32, 2) << @intCast(top)) - 1);
+    inline for (x) |*c| c.* &= keep;
+    var level: u8 = top + 1;
+    while (level > 0) {
+        level -= 1;
+        const digit: u32 = @intCast((h >> @as(Shift, @intCast(@as(u16, level) * dims))) & digit_mask);
+        const col = @bitReverse(digit) >> @intCast(32 - @as(u32, dims));
+        const above: u32 = if (level + 1 == bits) 0 else @intCast((h >> @as(Shift, @intCast(@as(u16, level + 1) * dims))) & 1);
+        const g = col ^ ((col << 1) & @as(u32, @truncate(digit_mask))) ^ above;
+        const w = maps[level].apply(g);
+        inline for (x, 0..) |*c, j| c.* |= ((w >> j) & 1) << @intCast(level);
+        if (level > 0) maps[level - 1] = ColumnMap(dims).level(g).then(maps[level]);
+    }
+}
+
 fn expectCurve(comptime dims: u8, comptime bits: u8) !void {
     const total: u32 = @as(u32, dims) * bits;
     const count: u64 = @as(u64, 1) << @intCast(total);
@@ -251,6 +375,46 @@ test "n-D matches Skilling's branching algorithm, including 128-bit spaces" {
         try decodeChecked(dims, bits, want, back[0..dims]);
         try std.testing.expectEqualSlices(u32, p[0..dims], back[0..dims]);
     }
+}
+
+fn expectRange(comptime dims: u8, comptime bits: u8, start: Index(dims, bits), count: usize) !void {
+    var buf: [4096][dims]u32 = undefined;
+    const out = buf[0..count];
+    decodeRange(dims, bits, start, out);
+    for (out, 0..) |p, i| try std.testing.expectEqualSlices(u32, &decode(dims, bits, start + @as(Index(dims, bits), @intCast(i))), &p);
+}
+
+test "decodeRange matches decode for every consecutive index" {
+    inline for (.{ .{ 1, 4 }, .{ 2, 1 }, .{ 2, 5 }, .{ 3, 4 }, .{ 4, 3 }, .{ 5, 2 }, .{ 6, 2 }, .{ 12, 1 } }) |s| {
+        const total = @as(usize, 1) << (s[0] * s[1]);
+        try expectRange(s[0], s[1], 0, total);
+    }
+    var prng = std.Random.DefaultPrng.init(17);
+    const r = prng.random();
+    inline for (.{ .{ 3, 21 }, .{ 8, 8 }, .{ 4, 32 }, .{ 32, 4 }, .{ 16, 8 }, .{ 1, 32 }, .{ 2, 32 }, .{ 5, 25 }, .{ 2, 16 } }) |s| {
+        const I = Index(s[0], s[1]);
+        const max = std.math.maxInt(I);
+        for (0..20) |_| try expectRange(s[0], s[1], r.int(I) % (max - 4096), 4096);
+        try expectRange(s[0], s[1], max - 4095, 4096);
+        try expectRange(s[0], s[1], 0, 4096);
+        // Carries through many levels at once.
+        try expectRange(s[0], s[1], (@as(I, 1) << (@bitSizeOf(I) - 1)) - 2048, 4096);
+    }
+}
+
+test "decodeRangeChecked matches decodeRange and validates" {
+    var flat: [3 * 500]u32 = undefined;
+    try decodeRangeChecked(3, 21, 123456789, &flat);
+    var want: [500][3]u32 = undefined;
+    decodeRange(3, 21, 123456789, &want);
+    try std.testing.expectEqualSlices(u32, @as(*const [1500]u32, @ptrCast(&want)), &flat);
+    try std.testing.expectError(error.IndexOutOfRange, decodeRangeChecked(3, 21, (1 << 63) - 499, &flat));
+    try decodeRangeChecked(3, 21, (1 << 63) - 500, &flat);
+    try std.testing.expectError(error.DimensionsOutOfRange, decodeRangeChecked(3, 21, 0, flat[0..10]));
+    try std.testing.expectError(error.OrderOutOfRange, decodeRangeChecked(5, 32, 0, flat[0..5]));
+    var wide: [4 * 8]u32 = undefined;
+    try decodeRangeChecked(4, 32, std.math.maxInt(u128) - 7, &wide);
+    try std.testing.expectEqualSlices(u32, &decode(4, 32, std.math.maxInt(u128)), wide[28..32]);
 }
 
 test "checked n-D matches comptime n-D and rejects bad input" {

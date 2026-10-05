@@ -180,7 +180,7 @@ fn run2d(b: Bench, comptime bits: u6, gpa: std.mem.Allocator, n: usize) !Results
 }
 
 fn runNd(b: Bench, gpa: std.mem.Allocator, n: usize) !void {
-    try b.out.print("\nn-D encode (Skilling transpose, branch-free)\n", .{});
+    try b.out.print("\nn-D (Skilling transpose, branch-free): encode random points, then decode\n", .{});
     inline for (.{ .{ 3, 21 }, .{ 8, 8 }, .{ 16, 8 } }) |s| {
         const dims = s[0];
         const bits = s[1];
@@ -203,6 +203,22 @@ fn runNd(b: Bench, gpa: std.mem.Allocator, n: usize) !void {
         const ns = b.time(&ctx, Ctx.f);
         var name_buf: [64]u8 = undefined;
         try b.report(try std.fmt.bufPrint(&name_buf, "{d} dims x {d} bits ({d}-bit key)", .{ dims, bits, dims * bits }), ns, n, ns);
+
+        const Dec = struct {
+            in: []hilbert.curvend.Index(dims, bits),
+            out: [][dims]u32,
+            fn each(c: *const @This()) void {
+                for (c.in, c.out) |h, *p| p.* = hilbert.decode(dims, bits, h);
+            }
+            fn walk(c: *const @This()) void {
+                hilbert.decodeRange(dims, bits, 1234567, c.out);
+            }
+        };
+        for (out, 0..) |*h, i| h.* = 1234567 + @as(hilbert.curvend.Index(dims, bits), @intCast(i));
+        const dec: Dec = .{ .in = out, .out = pts };
+        const each_ns = b.time(&dec, Dec.each);
+        try b.report("  decode, consecutive indices", each_ns, n, each_ns);
+        try b.report("  decodeRange (incremental)", b.time(&dec, Dec.walk), n, each_ns);
     }
 }
 

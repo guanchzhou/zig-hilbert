@@ -35,4 +35,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.assert(pt[1] == 200);
     const k2 = try hilbert.encodeChecked(3, 8, &.{ 10, 200, 37 }); // runtime shape, u128
     std.debug.assert(k2 == k);
+
+    // Walk the curve: consecutive indices, decoded incrementally.
+    var walk: [256][3]u32 = undefined;
+    hilbert.decodeRange(3, 8, 1000, &walk); // walk[i] = decode(3, 8, 1000 + i)
+    std.debug.assert(std.mem.eql(u32, &walk[5], &hilbert.decode(3, 8, 1005)));
 }

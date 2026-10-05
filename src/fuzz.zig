@@ -70,3 +70,27 @@ fn checkedNd(_: void, smith: *Smith) anyerror!void {
 test "fuzz: checked n-D encode and decode round-trip or reject" {
     try std.testing.fuzz({}, checkedNd, .{});
 }
+
+fn rangeNd(_: void, smith: *Smith) anyerror!void {
+    const dims = smith.valueRangeAtMost(u8, 1, curvend.max_dims);
+    const bits = smith.valueRangeAtMost(u8, 1, @min(curvend.max_bits, curvend.max_index_bits / dims));
+    const count: usize = smith.valueRangeAtMost(u8, 1, 64);
+    const total: u16 = @as(u16, dims) * bits;
+    const max: u128 = if (total == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(total)) - 1;
+    const start = smith.value(u128) & max;
+    var buf: [64 * curvend.max_dims]u32 = undefined;
+    const out = buf[0 .. count * dims];
+    curvend.decodeRangeChecked(dims, bits, start, out) catch |err| {
+        try std.testing.expect(err == error.IndexOutOfRange and count - 1 > max - start);
+        return;
+    };
+    var one: [curvend.max_dims]u32 = undefined;
+    for (0..count) |i| {
+        try curvend.decodeChecked(dims, bits, start + i, one[0..dims]);
+        try std.testing.expectEqualSlices(u32, one[0..dims], out[i * dims ..][0..dims]);
+    }
+}
+
+test "fuzz: decodeRange equals decode index by index" {
+    try std.testing.fuzz({}, rangeNd, .{});
+}

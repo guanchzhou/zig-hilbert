@@ -171,6 +171,22 @@ pub fn decode(comptime dims: u8, comptime bits: u8, indices: []const curvend.Ind
     try parallel.run(exec, out.len, min / (@as(usize, dims) * 4), &ctx, Ctx.run);
 }
 
+/// `curvend.decodeRange` split across `exec`: each part restarts the walk
+/// at its own first index.
+pub fn decodeRange(comptime dims: u8, comptime bits: u8, start: curvend.Index(dims, bits), out: [][dims]u32, exec: anytype) Result(@TypeOf(exec), error{}) {
+    if (out.len == 0) return;
+    std.debug.assert(out.len - 1 <= std.math.maxInt(curvend.Index(dims, bits)) - start);
+    const Ctx = struct {
+        start: curvend.Index(dims, bits),
+        out: [][dims]u32,
+        fn run(c: *const @This(), from: usize, to: usize) void {
+            curvend.decodeRange(dims, bits, c.start + @as(curvend.Index(dims, bits), @intCast(from)), c.out[from..to]);
+        }
+    };
+    const ctx: Ctx = .{ .start = start, .out = out };
+    try parallel.run(exec, out.len, min, &ctx, Ctx.run);
+}
+
 test "parallel batch matches scalar encode and round-trips" {
     const n = 3 * parallel.min_items_per_thread + 11;
     const gpa = std.testing.allocator;
@@ -243,4 +259,10 @@ test "n-D batch matches scalar encode and round-trips" {
     defer gpa.free(back);
     try decode(3, 21, keys, back, std.testing.io);
     try std.testing.expectEqualSlices([3]u32, pts, back);
+
+    const walk = try gpa.alloc([3]u32, 5 * parallel.min_items_per_thread + 3);
+    defer gpa.free(walk);
+    const start: u63 = 987654321;
+    try decodeRange(3, 21, start, walk, 4);
+    for (walk, 0..) |p, i| try std.testing.expectEqual(curvend.decode(3, 21, start + @as(u63, @intCast(i))), p);
 }

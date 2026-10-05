@@ -34,6 +34,9 @@ pub const encode = curvend.encode;
 pub const decode = curvend.decode;
 pub const encodeChecked = curvend.encodeChecked;
 pub const decodeChecked = curvend.decodeChecked;
+/// Decodes consecutive n-D indices incrementally (about one level per step).
+pub const decodeRange = curvend.decodeRange;
+pub const decodeRangeChecked = curvend.decodeRangeChecked;
 
 pub const Space = marker.Space;
 pub const Marker = marker.Marker;
