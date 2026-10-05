@@ -1,0 +1,3 @@
+zig-out/
+.zig-cache/
+bench/compare/.cache/

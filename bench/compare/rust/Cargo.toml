@@ -1,0 +1,13 @@
+[package]
+name = "fast-hilbert-compare"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fast_hilbert = "=2.1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,52 @@
+diff --git a/src/bench_root.zig b/src/bench_root.zig
+new file mode 100644
+index 0000000..dedace0
+--- /dev/null
++++ b/src/bench_root.zig
+@@ -0,0 +1,2 @@
++pub const domain = @import("domain.zig");
++pub const hilbert_affine = @import("hilbert_affine.zig");
+diff --git a/src/build_options.zig b/src/build_options.zig
+new file mode 100644
+index 0000000..073e2ee
+--- /dev/null
++++ b/src/build_options.zig
+@@ -0,0 +1 @@
++pub const curve_tier: enum { regular, full } = .regular;
+diff --git a/src/domain.zig b/src/domain.zig
+index df294a0..97ef535 100644
+--- a/src/domain.zig
++++ b/src/domain.zig
+@@ -138,7 +138,7 @@ fn ceil_log2(x: u64) u32 {
+ 
+ fn validate_permutation(n: u32, perm: []const u32) bool {
+     if (perm.len != n) return false;
+-    var seen = std.StaticBitSet(256).initEmpty();
++    var seen = std.StaticBitSet(256).empty;
+     if (n > 256) return false;
+     for (perm) |v| {
+         if (v >= n) return false;
+@@ -358,8 +358,8 @@ pub fn domainCreate(desc: *const DomainDesc, out_domain: *?*Domain, alloc: std.m
+     // Built through the same gray/child tables the computed path uses, so
+     // they are valid for every curve selection: a level width with curve
+     // tables sources them; otherwise the closed-form BRGC applies.
+-    var level_enc: [MAX_TABLE_K + 1]?[]u16 = .{null} ** (MAX_TABLE_K + 1);
+-    var level_dec: [MAX_TABLE_K + 1]?[]u16 = .{null} ** (MAX_TABLE_K + 1);
++    var level_enc: [MAX_TABLE_K + 1]?[]u16 = @splat(null);
++    var level_dec: [MAX_TABLE_K + 1]?[]u16 = @splat(null);
+     {
+         var s: u32 = 1;
+         while (s <= max_m) : (s += 1) {
+diff --git a/src/hilbert_affine.zig b/src/hilbert_affine.zig
+index f3d3db0..bbec618 100644
+--- a/src/hilbert_affine.zig
++++ b/src/hilbert_affine.zig
+@@ -929,7 +929,7 @@ pub fn encode_table_region(dom: *const domain_mod.Domain, mins: []const u64, max
+     var flat: u64 = 0;
+     @memcpy(out_table[0..words], cur_index[0..words]);
+ 
+-    var dirs = [_]i8{1} ** MAX_DIMS;
++    var dirs: [MAX_DIMS]i8 = @splat(1);
+     var step: u64 = 1;
+     while (step < total) : (step += 1) {
+         const mv = snake_step(cur[0..n], mins, maxs, dirs[0..n]) orelse break;
