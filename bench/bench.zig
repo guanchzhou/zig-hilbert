@@ -223,7 +223,7 @@ fn runMarkers(b: Bench, gpa: std.mem.Allocator, rows: usize) !void {
         out: []u128,
         threads: usize,
         fn f(c: *const @This()) void {
-            c.space.keys(c.data, c.out, c.threads) catch unreachable;
+            c.space.keys(c.data, c.out, c.threads, null) catch unreachable;
         }
     };
     const one: Ctx = .{ .space = &space, .data = data, .out = out, .threads = 1 };
@@ -248,7 +248,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     const out = &stdout.interface;
     const b: Bench = .{ .io = init.io, .out = out, .runs = if (quick) 5 else 9 };
     const n: usize = if (quick) 1 << 20 else 1 << 23;

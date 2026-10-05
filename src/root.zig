@@ -37,6 +37,7 @@ pub const decodeChecked = curvend.decodeChecked;
 
 pub const Space = marker.Space;
 pub const Marker = marker.Marker;
+pub const KeyRange = marker.KeyRange;
 
 test {
     _ = reference;
@@ -45,6 +46,7 @@ test {
     _ = parallel;
     _ = batch;
     _ = marker;
+    _ = @import("fuzz.zig");
 }
 
 test "checked 2D API validates input" {

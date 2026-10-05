@@ -58,7 +58,7 @@ pub fn run(
     const by = try gpa.alloc(u32, n);
     defer gpa.free(by);
     var buf: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     const out = &stdout.interface;
 
     inline for (.{ 32, 16 }) |bits| {

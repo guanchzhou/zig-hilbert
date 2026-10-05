@@ -52,7 +52,7 @@ fn batch(init: std.process.Init, n: usize) !void {
     const hs = try gpa.alloc(u64, n);
     defer gpa.free(hs);
     var buf: [256]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buf);
     inline for (.{ 32, 16 }) |bits| {
         harness.points(xs, ys, bits);
         for (xs, ys, 0..) |x, y, i| coords[2 * i ..][0..2].* = .{ x, y };
