@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 - 2026-10-05
+
+- `hilbert.s2.cover`, `coverCap`, `coverPolyline`, and `coverPolygon` cover
+  a disk, a polyline, a simple polygon, or a caller-defined region with
+  cells. `mergeRanges` turns those cells into inclusive id ranges.
+  `covering` is unchanged.
+- The `zig-hilbert` command accepts `s2-token`, `s2-cover`, `s2-polyline`,
+  and `s2-polygon`.
+- CI fuzzes on Linux as well as macOS. The fuzzer needs LLVM's coverage
+  instrumentation, so that job builds with `-Dllvm=true`.
+
 ## 0.2.0 - 2026-10-05
 
 - `decodeRange` and `decodeRangeChecked` decode consecutive n-D indices

@@ -14,4 +14,13 @@ pub fn main() void {
     var inside = false;
     for (got) |r| inside = inside or (cell.id >= r.lo and cell.id <= r.hi);
     std.debug.assert(inside);
+
+    const ring = [_]hilbert.s2.LatLng{
+        .{ .lat = 37.3, .lng = -122.2 },
+        .{ .lat = 37.5, .lng = -122.2 },
+        .{ .lat = 37.4, .lng = -122.0 },
+    };
+    var cells: [32]hilbert.s2.Cell = undefined;
+    const covered = hilbert.s2.coverPolygon(&ring, .{}, &cells) catch unreachable;
+    std.debug.assert(covered.len >= 1);
 }

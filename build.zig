@@ -5,6 +5,7 @@ const zon = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const force_llvm = b.option(bool, "llvm", "Force the LLVM code generator") orelse false;
 
     const hilbert = b.addModule("hilbert", .{
         .root_source_file = b.path("src/root.zig"),
@@ -32,7 +33,10 @@ pub fn build(b: *std.Build) void {
     run_cli.addPassthruArgs();
     b.step("run", "Run the zig-hilbert command").dependOn(&run_cli.step);
 
-    const tests = b.addTest(.{ .root_module = hilbert });
+    const tests = b.addTest(.{
+        .root_module = hilbert,
+        .use_llvm = if (force_llvm) true else null,
+    });
     const test_step = b.step("test", "Run the test suite");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 

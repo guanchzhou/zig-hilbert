@@ -22,7 +22,7 @@ other.
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.2.0
+zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.2.1
 ```
 
 ```zig
@@ -97,6 +97,15 @@ most 9 ranges. A radius of a quarter of the Earth's circumference or more
 returns one range covering the whole sphere. The ids use S2's quadratic
 projection and the same Hilbert orientation as `encode2`, swapped on odd
 cube faces.
+
+`coverCap`, `coverPolyline`, and `coverPolygon` cover a disk, a chain of
+shorter arcs, or the interior of a simple ring with cells. `cover` does
+the same for any region that can answer two questions: whether a cell
+might meet the region, and whether the cell is entirely inside it.
+`CoverOptions` sets `min_level`, `max_level` (default 16), and `max_cells`
+(default 8, a desired maximum). `mergeRanges` turns the cells into the
+inclusive id ranges a `BETWEEN` query uses. Each edge is the shorter arc
+between its endpoints.
 
 ### Compatibility
 
@@ -244,6 +253,9 @@ $ zig-out/bin/zig-hilbert cell hk1:8:8:9e3779b97f4a7c15:a0c28ad75ed48ca8
 $ zig-out/bin/zig-hilbert check hk1:8:8:XYZ          # exit 1 on invalid markers
 $ zig-out/bin/zig-hilbert encode2 16 12345 54321
 1555040834
+$ zig-out/bin/zig-hilbert s2-token 37.4 -122.1 12
+808fb0b
+$ printf '20 20\n20 20.2\n20.2 20.1\n' | zig-out/bin/zig-hilbert s2-polygon
 ```
 
 - **Input.** Each line of `key` input is a JSON array, or an object with an
@@ -254,7 +266,8 @@ $ zig-out/bin/zig-hilbert encode2 16 12345 54321
   `"ranges"` with `--probe LEVEL [--ranges N]`.
 - **Options.** `--dims`, `--bits`, `--seed HEX` (with or without `0x`), and
   `--threads` choose the space. `--max-line BYTES` (default 4 MiB) limits
-  the length of a line.
+  the length of a line. `s2-cover`, `s2-polyline`, and `s2-polygon` take
+  `--min-level`, `--max-level` (default 16), and `--max-cells` (default 8).
 - **Errors.** They name the input line (`line 4: NonFiniteValue`) and exit
   with code 1. Markers already printed for earlier blocks stay valid.
 - **Help.** `zig-hilbert --help` lists every command, and

@@ -28,6 +28,16 @@ const usage =
     \\        exit 0 and echo the marker if it is valid, exit 1 otherwise
     \\  zig-hilbert encode2 BITS X Y
     \\  zig-hilbert decode2 BITS INDEX
+    \\  zig-hilbert s2-token LAT LNG [LEVEL]
+    \\        stdout: the S2 hex token of that cell
+    \\  zig-hilbert s2-cover LAT LNG RADIUS_M [--min-level N] [--max-level N] [--max-cells N]
+    \\        stdout: one "LO HI" cell-id range per line covering the cap
+    \\  zig-hilbert s2-polyline [--min-level N] [--max-level N] [--max-cells N]
+    \\        stdin: "LAT LNG" per line
+    \\        stdout: one "LO HI" range per line covering the points and the arcs between them
+    \\  zig-hilbert s2-polygon [--min-level N] [--max-level N] [--max-cells N]
+    \\        stdin: "LAT LNG" per line, a ring of at least 3 vertices
+    \\        stdout: one "LO HI" range per line covering the interior
     \\  zig-hilbert version
     \\
 ;
@@ -45,6 +55,61 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 
 fn parseInt(comptime T: type, text: []const u8, what: []const u8) T {
     return std.fmt.parseInt(T, text, 0) catch fail("invalid {s}: {s}", .{ what, text });
+}
+
+fn parseFloat(text: []const u8, what: []const u8) f64 {
+    return std.fmt.parseFloat(f64, text) catch fail("invalid {s}: {s}", .{ what, text });
+}
+
+const max_cover_cells = 1024;
+
+fn parseCoverOptions(args: []const [:0]const u8) hilbert.s2.CoverOptions {
+    var o: hilbert.s2.CoverOptions = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        const name = args[i];
+        if (i + 1 >= args.len) fail("missing value for {s}", .{name});
+        const v = args[i + 1];
+        if (eql(name, "--min-level")) {
+            o.min_level = parseInt(u8, v, "min-level");
+        } else if (eql(name, "--max-level")) {
+            o.max_level = parseInt(u8, v, "max-level");
+        } else if (eql(name, "--max-cells")) {
+            o.max_cells = parseInt(u16, v, "max-cells");
+        } else fail("unknown option: {s}", .{name});
+    }
+    return o;
+}
+
+fn printRanges(out: *std.Io.Writer, cells: []const hilbert.s2.Cell) !void {
+    var ranges: [max_cover_cells]hilbert.s2.Range = undefined;
+    const got = hilbert.s2.mergeRanges(cells, &ranges) catch |e| fail("{s}", .{@errorName(e)});
+    for (got) |r| try out.print("{d} {d}\n", .{ r.lo, r.hi });
+}
+
+fn readLatLngs(init: std.process.Init) ![]hilbert.s2.LatLng {
+    const gpa = init.gpa;
+    var in_buf: [512]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(init.io, &in_buf);
+    var list: std.ArrayList(hilbert.s2.LatLng) = .empty;
+    errdefer list.deinit(gpa);
+    var line_no: usize = 0;
+    while (true) {
+        const raw = stdin.interface.takeDelimiter('\n') catch |e| switch (e) {
+            error.StreamTooLong => fail("line {d}: longer than {d} bytes", .{ line_no + 1, in_buf.len }),
+            error.ReadFailed => return stdin.err.?,
+        } orelse break;
+        line_no += 1;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        const lat_s = it.next() orelse fail("line {d}: expected LAT LNG", .{line_no});
+        const lng_s = it.next() orelse fail("line {d}: expected LAT LNG", .{line_no});
+        if (it.next() != null) fail("line {d}: expected LAT LNG", .{line_no});
+        try list.append(gpa, .{ .lat = parseFloat(lat_s, "lat"), .lng = parseFloat(lng_s, "lng") });
+    }
+    if (list.items.len == 0) fail("no points on stdin", .{});
+    return list.toOwnedSlice(gpa);
 }
 
 fn parseMarker(text: []const u8) hilbert.Marker {
@@ -97,6 +162,34 @@ pub fn main(init: std.process.Init) !void {
         const p = hilbert.decode2Checked(parseInt(u6, rest[0], "bits"), parseInt(u64, rest[1], "index")) catch |e|
             fail("{s}", .{@errorName(e)});
         try out.print("{d} {d}\n", .{ p.x, p.y });
+    } else if (eql(cmd, "s2-token")) {
+        if (rest.len != 2 and rest.len != 3) fail("s2-token takes LAT LNG [LEVEL]", .{});
+        const cell = hilbert.s2.fromLatLng(parseFloat(rest[0], "lat"), parseFloat(rest[1], "lng")) catch |e|
+            fail("{s}", .{@errorName(e)});
+        const at = if (rest.len == 3) blk: {
+            const level = parseInt(u8, rest[2], "level");
+            if (level > cell.level()) fail("LevelOutOfRange", .{});
+            break :blk cell.parent(level);
+        } else cell;
+        var buf_tok: [16]u8 = undefined;
+        try out.print("{s}\n", .{at.token(&buf_tok)});
+    } else if (eql(cmd, "s2-cover")) {
+        if (rest.len < 3) fail("s2-cover takes LAT LNG RADIUS_M", .{});
+        const opts = parseCoverOptions(rest[3..]);
+        var cells: [max_cover_cells]hilbert.s2.Cell = undefined;
+        const got = hilbert.s2.coverCap(parseFloat(rest[0], "lat"), parseFloat(rest[1], "lng"), parseFloat(rest[2], "radius"), opts, &cells) catch |e|
+            fail("{s}", .{@errorName(e)});
+        try printRanges(out, got);
+    } else if (eql(cmd, "s2-polyline") or eql(cmd, "s2-polygon")) {
+        const opts = parseCoverOptions(rest);
+        const points = try readLatLngs(init);
+        defer init.gpa.free(points);
+        var cells: [max_cover_cells]hilbert.s2.Cell = undefined;
+        const got = if (eql(cmd, "s2-polyline"))
+            hilbert.s2.coverPolyline(points, opts, &cells) catch |e| fail("{s}", .{@errorName(e)})
+        else
+            hilbert.s2.coverPolygon(points, opts, &cells) catch |e| fail("{s}", .{@errorName(e)});
+        try printRanges(out, got);
     } else if (eql(cmd, "version") or eql(cmd, "--version")) {
         try out.print("zig-hilbert {s}\n", .{build_options.version});
     } else if (eql(cmd, "help") or eql(cmd, "--help") or eql(cmd, "-h")) {

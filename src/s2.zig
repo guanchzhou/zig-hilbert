@@ -20,6 +20,8 @@ pub const Error = error{
     NonFinite,
     RadiusOutOfRange,
     BufferTooSmall,
+    CoverOptionsOutOfRange,
+    RegionOutOfRange,
 };
 
 pub const LatLng = struct { lat: f64, lng: f64 };
@@ -230,6 +232,142 @@ pub fn covering(lat: f64, lng: f64, radius_m: f64, out: []Range) Error![]Range {
     return out[0..merged];
 }
 
+/// Limits for `cover`. `max_cells` is a desired maximum: a region that meets
+/// more than that many cube faces still returns one cell per face.
+pub const CoverOptions = struct {
+    min_level: u8 = 0,
+    max_level: u8 = 16,
+    max_cells: u16 = 8,
+};
+
+/// A region the coverer can ask two questions about. `mayIntersect` must be
+/// true whenever the cell meets the region. `contains` is true only when
+/// every point of the cell is inside the region.
+pub const Region = struct {
+    ctx: *const anyopaque,
+    mayIntersect: *const fn (ctx: *const anyopaque, cell: Cell) bool,
+    contains: *const fn (ctx: *const anyopaque, cell: Cell) bool,
+};
+
+const max_cover_scratch = 2048;
+
+/// Cells covering `region`, sorted by id. `out` must hold at least
+/// `max(opts.max_cells, 6)` cells. Each edge of a polyline or polygon is the
+/// shorter arc between its endpoints.
+pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
+    if (opts.max_cells == 0 or opts.min_level > opts.max_level or opts.max_level > max_level) {
+        return error.CoverOptionsOutOfRange;
+    }
+    var scratch: [max_cover_scratch]Cell = undefined;
+    var n: usize = 0;
+    for (0..6) |face_| {
+        const cell = Cell.fromFace(@intCast(face_));
+        if (region.mayIntersect(region.ctx, cell)) {
+            scratch[n] = cell;
+            n += 1;
+        }
+    }
+
+    var result_n: usize = 0;
+    while (n > 0) {
+        var best: usize = 0;
+        for (scratch[1..n], 1..) |cell, i| {
+            const cur = scratch[best];
+            if (cell.level() < cur.level() or (cell.level() == cur.level() and cell.id < cur.id)) best = i;
+        }
+        const cell = scratch[best];
+        n -= 1;
+        scratch[best] = scratch[n];
+
+        if (cell.level() < opts.min_level) {
+            for (cell.children()) |child_| {
+                if (!region.mayIntersect(region.ctx, child_)) continue;
+                if (n >= scratch.len) return error.BufferTooSmall;
+                scratch[n] = child_;
+                n += 1;
+            }
+            continue;
+        }
+
+        const stop = region.contains(region.ctx, cell) or cell.level() >= opts.max_level;
+        if (stop) {
+            if (result_n >= out.len) return error.BufferTooSmall;
+            out[result_n] = cell;
+            result_n += 1;
+            continue;
+        }
+
+        var hit: [4]Cell = undefined;
+        var hn: usize = 0;
+        for (cell.children()) |child_| {
+            if (region.mayIntersect(region.ctx, child_)) {
+                hit[hn] = child_;
+                hn += 1;
+            }
+        }
+        if (hn == 0) continue;
+        if (result_n + n + hn > opts.max_cells or n + hn > scratch.len) {
+            if (result_n >= out.len) return error.BufferTooSmall;
+            out[result_n] = cell;
+            result_n += 1;
+        } else {
+            for (hit[0..hn]) |child_| {
+                scratch[n] = child_;
+                n += 1;
+            }
+        }
+    }
+
+    std.mem.sort(Cell, out[0..result_n], {}, struct {
+        fn less(_: void, a: Cell, b: Cell) bool {
+            return a.id < b.id;
+        }
+    }.less);
+    return out[0..result_n];
+}
+
+/// Merge `cells` (sorted by id) into inclusive id ranges.
+pub fn mergeRanges(cells: []const Cell, out: []Range) Error![]Range {
+    var n: usize = 0;
+    for (cells) |cell| {
+        const r = cell.range();
+        if (n > 0 and r.lo <= out[n - 1].hi +% 1) {
+            out[n - 1].hi = @max(out[n - 1].hi, r.hi);
+        } else {
+            if (n >= out.len) return error.BufferTooSmall;
+            out[n] = r;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// Cells covering the cap of `radius_m` around the point.
+pub fn coverCap(lat: f64, lng: f64, radius_m: f64, opts: CoverOptions, out: []Cell) Error![]Cell {
+    if (!std.math.isFinite(radius_m) or radius_m < 0) return error.RadiusOutOfRange;
+    const cap = Cap{
+        .center = try latLngToXyz(lat, lng),
+        .angle = @min(radius_m / earth_radius_m, std.math.pi),
+    };
+    return cover(cap.region(), opts, out);
+}
+
+/// Cells covering the shorter arcs through `points`, in order.
+pub fn coverPolyline(points: []const LatLng, opts: CoverOptions, out: []Cell) Error![]Cell {
+    if (points.len == 0) return out[0..0];
+    var verts: [max_region_verts]Xyz = undefined;
+    const line = try xyzVerts(points, &verts);
+    return cover(line.region(), opts, out);
+}
+
+/// Cells covering the interior of a simple ring. `points` has at least 3
+/// vertices; a repeated closing vertex is ignored.
+pub fn coverPolygon(points: []const LatLng, opts: CoverOptions, out: []Cell) Error![]Cell {
+    var verts: [max_region_verts]Xyz = undefined;
+    const ring = try polygonVerts(points, &verts);
+    return cover(ring.region(), opts, out);
+}
+
 fn lsb(id: u64) u64 {
     return id & (~id +% 1);
 }
@@ -385,6 +523,243 @@ fn cellAt(face_: u3, i: i32, j: i32, level_: u8) Cell {
     return leaf_.parent(level_);
 }
 
+const max_region_verts = 4096;
+
+const Cap = struct {
+    center: Xyz,
+    angle: f64,
+
+    fn region(self: *const Cap) Region {
+        return .{
+            .ctx = @ptrCast(self),
+            .mayIntersect = mayIntersect,
+            .contains = containsCell,
+        };
+    }
+
+    fn mayIntersect(ctx: *const anyopaque, cell: Cell) bool {
+        const self: *const Cap = @ptrCast(@alignCast(ctx));
+        const bound = cellCap(cell);
+        return angleBetween(self.center, bound.center) <= self.angle + bound.angle;
+    }
+
+    fn containsCell(ctx: *const anyopaque, cell: Cell) bool {
+        const self: *const Cap = @ptrCast(@alignCast(ctx));
+        const bound = cellCap(cell);
+        return angleBetween(self.center, bound.center) + bound.angle <= self.angle;
+    }
+};
+
+const Polyline = struct {
+    pts: []const Xyz,
+
+    fn region(self: *const Polyline) Region {
+        return .{
+            .ctx = @ptrCast(self),
+            .mayIntersect = mayIntersect,
+            .contains = containsCell,
+        };
+    }
+
+    fn mayIntersect(ctx: *const anyopaque, cell: Cell) bool {
+        const self: *const Polyline = @ptrCast(@alignCast(ctx));
+        return chainHits(self.pts, cell, false);
+    }
+
+    fn containsCell(_: *const anyopaque, _: Cell) bool {
+        return false;
+    }
+};
+
+const Polygon = struct {
+    pts: []const Xyz,
+
+    fn region(self: *const Polygon) Region {
+        return .{
+            .ctx = @ptrCast(self),
+            .mayIntersect = mayIntersect,
+            .contains = containsCell,
+        };
+    }
+
+    fn mayIntersect(ctx: *const anyopaque, cell: Cell) bool {
+        const self: *const Polygon = @ptrCast(@alignCast(ctx));
+        if (chainHits(self.pts, cell, true)) return true;
+        if (self.pts.len < 2) return false;
+        return polygonContains(self.pts, cellCap(cell).center);
+    }
+
+    fn containsCell(ctx: *const anyopaque, cell: Cell) bool {
+        const self: *const Polygon = @ptrCast(@alignCast(ctx));
+        if (chainHits(self.pts, cell, true)) return false;
+        return polygonContains(self.pts, cellCap(cell).center);
+    }
+};
+
+fn xyzVerts(points: []const LatLng, buf: []Xyz) Error!Polyline {
+    if (points.len > buf.len) return error.BufferTooSmall;
+    for (points, 0..) |p, i| buf[i] = try latLngToXyz(p.lat, p.lng);
+    return .{ .pts = buf[0..points.len] };
+}
+
+fn polygonVerts(points: []const LatLng, buf: []Xyz) Error!Polygon {
+    if (points.len < 3) return error.RegionOutOfRange;
+    var n = points.len;
+    const last = points[n - 1];
+    const first = points[0];
+    if (last.lat == first.lat and last.lng == first.lng) n -= 1;
+    if (n < 3) return error.RegionOutOfRange;
+    if (n > buf.len) return error.BufferTooSmall;
+    for (points[0..n], 0..) |p, i| buf[i] = try latLngToXyz(p.lat, p.lng);
+    return .{ .pts = buf[0..n] };
+}
+
+fn latLngToXyz(lat: f64, lng: f64) Error!Xyz {
+    if (!std.math.isFinite(lat) or !std.math.isFinite(lng)) return error.NonFinite;
+    if (lat < -90 or lat > 90) return error.LatitudeOutOfRange;
+    const phi = lat * (std.math.pi / 180.0);
+    const theta = lng * (std.math.pi / 180.0);
+    const cos_phi = @cos(phi);
+    return .{ .x = cos_phi * @cos(theta), .y = cos_phi * @sin(theta), .z = @sin(phi) };
+}
+
+fn normalize(p: Xyz) Xyz {
+    const len = @sqrt(dot(p, p));
+    return .{ .x = p.x / len, .y = p.y / len, .z = p.z / len };
+}
+
+fn dot(a: Xyz, b: Xyz) f64 {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+fn cross(a: Xyz, b: Xyz) Xyz {
+    return .{
+        .x = a.y * b.z - a.z * b.y,
+        .y = a.z * b.x - a.x * b.z,
+        .z = a.x * b.y - a.y * b.x,
+    };
+}
+
+fn angleBetween(a: Xyz, b: Xyz) f64 {
+    return std.math.acos(std.math.clamp(dot(a, b), -1.0, 1.0));
+}
+
+const CellRect = struct { face: u3, i0: i32, j0: i32, i1: i32, j1: i32 };
+
+fn cellRect(cell: Cell) CellRect {
+    var i: i32 = undefined;
+    var j: i32 = undefined;
+    const face_ = toFaceIJ(cell, &i, &j);
+    const half = @divFloor(sizeIJ(cell.level()), 2);
+    return .{
+        .face = face_,
+        .i0 = i - half,
+        .j0 = j - half,
+        .i1 = i - half + sizeIJ(cell.level()),
+        .j1 = j - half + sizeIJ(cell.level()),
+    };
+}
+
+fn ijToXyz(face_: u3, i: i32, j: i32) Xyz {
+    const limit: f64 = @floatFromInt(max_size);
+    const s = std.math.clamp(@as(f64, @floatFromInt(i)) / limit, 0.0, 1.0);
+    const t = std.math.clamp(@as(f64, @floatFromInt(j)) / limit, 0.0, 1.0);
+    return normalize(faceUvToXyz(face_, stToUv(s), stToUv(t)));
+}
+
+fn cellVertices(cell: Cell) [4]Xyz {
+    const r = cellRect(cell);
+    return .{
+        ijToXyz(r.face, r.i0, r.j0),
+        ijToXyz(r.face, r.i1, r.j0),
+        ijToXyz(r.face, r.i1, r.j1),
+        ijToXyz(r.face, r.i0, r.j1),
+    };
+}
+
+fn cellCap(cell: Cell) Cap {
+    const v = cellVertices(cell);
+    var sum = Xyz{ .x = 0, .y = 0, .z = 0 };
+    for (v) |p| {
+        sum.x += p.x;
+        sum.y += p.y;
+        sum.z += p.z;
+    }
+    const center = normalize(sum);
+    var ang: f64 = 0;
+    for (v) |p| ang = @max(ang, angleBetween(center, p));
+    return .{ .center = center, .angle = ang };
+}
+
+fn pointIJ(p: Xyz) struct { face: u3, i: i32, j: i32 } {
+    var u: f64 = undefined;
+    var v: f64 = undefined;
+    const face_ = xyzToFaceUv(p.x, p.y, p.z, &u, &v);
+    return .{
+        .face = face_,
+        .i = @intCast(stToIJ(uvToSt(u))),
+        .j = @intCast(stToIJ(uvToSt(v))),
+    };
+}
+
+fn cellContainsPoint(cell: Cell, p: Xyz) bool {
+    const q = pointIJ(p);
+    const r = cellRect(cell);
+    return q.face == r.face and q.i >= r.i0 and q.i < r.i1 and q.j >= r.j0 and q.j < r.j1;
+}
+
+fn arcsCross(a: Xyz, b: Xyz, c: Xyz, d: Xyz) bool {
+    const ab = cross(a, b);
+    const cd = cross(c, d);
+    const s1 = dot(ab, c);
+    const s2 = dot(ab, d);
+    const s3 = dot(cd, a);
+    const s4 = dot(cd, b);
+    // A zero means the arcs touch. Same-side pairs are disjoint.
+    if (s1 * s2 > 0 or s3 * s4 > 0) return false;
+    return true;
+}
+
+fn segmentHitsCell(a: Xyz, b: Xyz, cell: Cell) bool {
+    if (cellContainsPoint(cell, a) or cellContainsPoint(cell, b)) return true;
+    const v = cellVertices(cell);
+    for (0..4) |k| {
+        if (arcsCross(a, b, v[k], v[(k + 1) % 4])) return true;
+    }
+    return false;
+}
+
+fn chainHits(pts: []const Xyz, cell: Cell, closed: bool) bool {
+    if (pts.len == 0) return false;
+    for (pts) |p| if (cellContainsPoint(cell, p)) return true;
+    if (pts.len == 1) return false;
+    for (pts[0 .. pts.len - 1], pts[1..]) |a, b| {
+        if (segmentHitsCell(a, b, cell)) return true;
+    }
+    if (closed and pts.len >= 3 and segmentHitsCell(pts[pts.len - 1], pts[0], cell)) return true;
+    return false;
+}
+
+fn polygonContains(pts: []const Xyz, p: Xyz) bool {
+    var sum: f64 = 0;
+    for (pts, 0..) |a, i| {
+        const b = pts[(i + 1) % pts.len];
+        const ta = tangent(p, a) orelse return true;
+        const tb = tangent(p, b) orelse return true;
+        const na = normalize(ta);
+        const nb = normalize(tb);
+        sum += std.math.atan2(dot(p, cross(na, nb)), dot(na, nb));
+    }
+    return @abs(sum) > std.math.pi;
+}
+
+fn tangent(origin: Xyz, p: Xyz) ?Xyz {
+    const d = dot(origin, p);
+    const t = Xyz{ .x = p.x - origin.x * d, .y = p.y - origin.y * d, .z = p.z - origin.z * d };
+    if (dot(t, t) < 1e-24) return null;
+    return t;
+}
+
 fn neighborhood(cell: Cell, out: *[9]Cell) usize {
     const level_ = cell.level();
     const size = sizeIJ(level_);
@@ -514,4 +889,67 @@ test "centers, neighbours, and coverings stay on the sphere" {
     try std.testing.expectEqual(@as(usize, 1), whole.len);
     try std.testing.expect((try fromLatLng(-40, 70)).id >= whole[0].lo);
     try std.testing.expectError(error.BufferTooSmall, covering(10, 20, 50, one[0..0]));
+}
+
+fn cellCovers(cells: []const Cell, lat: f64, lng: f64) !bool {
+    const leaf_ = try fromLatLng(lat, lng);
+    for (cells) |cell| if (cell.contains(leaf_)) return true;
+    return false;
+}
+
+test "region covers contain the cap, the line, and the polygon" {
+    const opts = CoverOptions{ .max_level = 12, .max_cells = 32 };
+    var out: [64]Cell = undefined;
+
+    const cap = try coverCap(37.4, -122.1, 1000, opts, &out);
+    try std.testing.expect(try cellCovers(cap, 37.4, -122.1));
+    try std.testing.expect(!try cellCovers(cap, 0, 0));
+    try std.testing.expect(cap.len <= opts.max_cells);
+
+    const line = [_]LatLng{
+        .{ .lat = 10, .lng = 10 },
+        .{ .lat = 10.2, .lng = 10.3 },
+        .{ .lat = 10.4, .lng = 10.1 },
+    };
+    const lined = try coverPolyline(&line, opts, &out);
+    for (line) |p| try std.testing.expect(try cellCovers(lined, p.lat, p.lng));
+    try std.testing.expect(try cellCovers(lined, 10.1, 10.15));
+    try std.testing.expectEqual(@as(usize, 0), (try coverPolyline(line[0..0], opts, &out)).len);
+
+    const ring = [_]LatLng{
+        .{ .lat = 20, .lng = 20 },
+        .{ .lat = 20, .lng = 20.2 },
+        .{ .lat = 20.2, .lng = 20.1 },
+    };
+    const poly = try coverPolygon(&ring, opts, &out);
+    try std.testing.expect(try cellCovers(poly, 20.05, 20.1));
+    try std.testing.expect(!try cellCovers(poly, 0, 0));
+    const closed = [_]LatLng{ ring[0], ring[1], ring[2], ring[0] };
+    try std.testing.expect(try cellCovers(try coverPolygon(&closed, opts, &out), 20.05, 20.1));
+    try std.testing.expectError(error.RegionOutOfRange, coverPolygon(ring[0..2], opts, &out));
+
+    const only_face_0 = struct {
+        fn mayIntersect(_: *const anyopaque, cell: Cell) bool {
+            return cell.face() == 0;
+        }
+        fn contains(_: *const anyopaque, cell: Cell) bool {
+            return cell.face() == 0 and cell.level() == 0;
+        }
+    };
+    var dummy: u8 = 0;
+    const got = try cover(.{
+        .ctx = &dummy,
+        .mayIntersect = only_face_0.mayIntersect,
+        .contains = only_face_0.contains,
+    }, .{}, &out);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqual(Cell.fromFace(0).id, got[0].id);
+
+    var ranges: [64]Range = undefined;
+    const merged = try mergeRanges(got, &ranges);
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(got[0].range().lo, merged[0].lo);
+
+    try std.testing.expectError(error.CoverOptionsOutOfRange, coverCap(0, 0, 1, .{ .min_level = 3, .max_level = 1 }, &out));
+    try std.testing.expectError(error.BufferTooSmall, coverCap(0, 0, 1, opts, out[0..0]));
 }

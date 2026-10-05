@@ -48,10 +48,9 @@ jobs:
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig build test -Doptimize=ReleaseFast
       - name: Fuzz
-        # Zig 0.17 Debug builds on x86_64 Linux use the self-hosted backend,
-        # which emits no coverage instrumentation for the fuzzer.
-        if: matrix.os == 'macos-latest'
-        run: zig build test --fuzz=50K
+        # Debug builds on x86_64 Linux use the self-hosted backend, which
+        # emits no coverage instrumentation. LLVM is what the fuzzer needs.
+        run: zig build test -Dllvm=true --fuzz=50K
       - run: zig build perf-check
       - name: Build a consumer project from the package
         if: matrix.os == 'ubuntu-latest'
