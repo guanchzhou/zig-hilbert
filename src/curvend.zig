@@ -30,12 +30,13 @@ inline fn bitMask(word: u32, level: u5) u32 {
     return 0 -% ((word >> level) & 1);
 }
 
-inline fn axesToTranspose(x: []u32, bits: u8) void {
+/// `x` points to an array, so the per-axis loops unroll.
+inline fn axesToTranspose(x: anytype, bits: u8) void {
     const n = x.len;
     var level: u5 = @intCast(bits - 1);
     while (level > 0) : (level -= 1) {
         const p = (@as(u32, 1) << level) - 1;
-        for (0..n) |i| {
+        inline for (0..n) |i| {
             const invert = bitMask(x[i], level);
             x[0] ^= p & invert;
             const t = (x[0] ^ x[i]) & p & ~invert;
@@ -43,25 +44,23 @@ inline fn axesToTranspose(x: []u32, bits: u8) void {
             x[i] ^= t;
         }
     }
-    for (1..n) |i| x[i] ^= x[i - 1];
-    var t: u32 = 0;
-    level = @intCast(bits - 1);
-    while (level > 0) : (level -= 1) t ^= ((@as(u32, 1) << level) - 1) & bitMask(x[n - 1], level);
-    for (0..n) |i| x[i] ^= t;
+    inline for (1..n) |i| x[i] ^= x[i - 1];
+    // Bit k of t is the parity of the bits of x[n - 1] above k.
+    var t = x[n - 1] >> 1;
+    inline for (.{ 1, 2, 4, 8, 16 }) |s| t ^= t >> s;
+    inline for (0..n) |i| x[i] ^= t;
 }
 
-inline fn transposeToAxes(x: []u32, bits: u8) void {
+inline fn transposeToAxes(x: anytype, bits: u8) void {
     const n = x.len;
     const t = x[n - 1] >> 1;
-    var i = n - 1;
-    while (i > 0) : (i -= 1) x[i] ^= x[i - 1];
+    inline for (0..n - 1) |r| x[n - 1 - r] ^= x[n - 2 - r];
     x[0] ^= t;
     var level: u5 = 1;
     while (level < bits) : (level += 1) {
         const p = (@as(u32, 1) << level) - 1;
-        var j = n;
-        while (j > 0) {
-            j -= 1;
+        inline for (0..n) |r| {
+            const j = n - 1 - r;
             const invert = bitMask(x[j], level);
             x[0] ^= p & invert;
             const s = (x[0] ^ x[j]) & p & ~invert;
@@ -72,28 +71,60 @@ inline fn transposeToAxes(x: []u32, bits: u8) void {
     }
 }
 
-inline fn interleave(comptime I: type, x: []const u32, bits: u8) I {
-    var h: I = 0;
-    var level = bits;
-    while (level > 0) {
-        level -= 1;
-        for (x) |axis| h = (h << 1) | @as(I, @intCast((axis >> @intCast(level)) & 1));
+/// Masks for spreading a 32-bit value so that bit `l` lands at `l * dims`.
+/// Stage `i` works on blocks of `s = 32 >> i` bits; after it, block `k`
+/// (bits `k*s ..`) sits at `k * s * dims`. Moving from blocks of `2s` to
+/// blocks of `s` shifts every upper half by the same `s * (dims - 1)`.
+fn spreadMasks(comptime dims: u8, comptime W: type) [6]W {
+    @setEvalBranchQuota(100_000);
+    const width = @bitSizeOf(W);
+    const levels = @min(32, width / dims);
+    var masks: [6]W = @splat(0);
+    for (0..6) |i| {
+        const s = 32 >> i;
+        var k = 0;
+        while (k * s < levels) : (k += 1) {
+            const at = k * s * dims;
+            if (at < width) masks[i] |= @as(W, @truncate((@as(u256, 1) << s) - 1)) << at;
+        }
     }
+    return masks;
+}
+
+inline fn spread(comptime dims: u8, comptime W: type, v: u32) W {
+    if (dims == 1) return v;
+    const masks = comptime spreadMasks(dims, W);
+    var w: W = v;
+    inline for (1..6) |i| {
+        const shift = (32 >> i) * (@as(u32, dims) - 1);
+        if (shift < @bitSizeOf(W)) w = (w | (w << shift)) & masks[i];
+    }
+    return w;
+}
+
+inline fn compress(comptime dims: u8, comptime W: type, w0: W) u32 {
+    if (dims == 1) return @truncate(w0);
+    const masks = comptime spreadMasks(dims, W);
+    var w = w0 & masks[5];
+    inline for (0..5) |r| {
+        const i = 4 - r;
+        const shift = (32 >> (i + 1)) * (@as(u32, dims) - 1);
+        if (shift < @bitSizeOf(W)) w = (w | (w >> shift)) & masks[i];
+    }
+    return @truncate(w);
+}
+
+/// Transpose-order index of `x`: bit `l` of axis `j` lands at
+/// `l * dims + (dims - 1 - j)`. Shift-and-mask spreading takes about
+/// `5 * dims` operations instead of one step per index bit.
+inline fn interleaveFast(comptime dims: u8, comptime W: type, x: *const [dims]u32) W {
+    var h: W = 0;
+    inline for (0..dims) |j| h |= spread(dims, W, x[j]) << (dims - 1 - j);
     return h;
 }
 
-inline fn deinterleave(comptime I: type, h: I, x: []u32, bits: u8) void {
-    @memset(x, 0);
-    const n = x.len;
-    var pos: u32 = @as(u32, bits) * @as(u32, @intCast(n));
-    var level = bits;
-    while (level > 0) {
-        level -= 1;
-        for (0..n) |i| {
-            pos -= 1;
-            x[i] |= @as(u32, @intCast((h >> @intCast(pos)) & 1)) << @intCast(level);
-        }
-    }
+inline fn deinterleaveFast(comptime dims: u8, comptime W: type, h: W, x: *[dims]u32) void {
+    inline for (0..dims) |j| x[j] = compress(dims, W, h >> (dims - 1 - j));
 }
 
 /// Hilbert index of `point` in a `dims`-dimensional cube with `2^bits` cells
@@ -105,16 +136,21 @@ pub fn encode(comptime dims: u8, comptime bits: u8, point: [dims]u32) Index(dims
         for (&x) |*c| c.* &= (@as(u32, 1) << @intCast(bits)) - 1;
     }
     axesToTranspose(&x, bits);
-    return interleave(Index(dims, bits), &x, bits);
+    return @intCast(interleaveFast(dims, Word(dims, bits), &x));
 }
 
 /// Inverse of `encode`.
 pub fn decode(comptime dims: u8, comptime bits: u8, index: Index(dims, bits)) [dims]u32 {
     comptime validSpace(dims, bits) catch @compileError("unsupported space");
     var x: [dims]u32 = undefined;
-    deinterleave(Index(dims, bits), index, &x, bits);
+    deinterleaveFast(dims, Word(dims, bits), index, &x);
     transposeToAxes(&x, bits);
     return x;
+}
+
+/// Machine word wide enough for the index: one register when it fits.
+fn Word(comptime dims: u8, comptime bits: u8) type {
+    return if (@as(u16, dims) * bits <= 64) u64 else u128;
 }
 
 /// Runtime-space encode that validates its arguments. The index is
@@ -122,14 +158,18 @@ pub fn decode(comptime dims: u8, comptime bits: u8, index: Index(dims, bits)) [d
 pub fn encodeChecked(dims: u8, bits: u8, point: []const u32) Error!u128 {
     try validSpace(dims, bits);
     if (point.len != dims) return error.DimensionsOutOfRange;
-    var buf: [max_dims]u32 = undefined;
-    const x = buf[0..dims];
-    for (point, x) |c, *dst| {
+    for (point) |c| {
         if (bits < 32 and c >> @intCast(bits) != 0) return error.CoordinateOutOfRange;
-        dst.* = c;
     }
-    axesToTranspose(x, bits);
-    return interleave(u128, x, bits);
+    @setEvalBranchQuota(100_000);
+    switch (dims) {
+        inline 1...max_dims => |d| {
+            var x: [d]u32 = point[0..d].*;
+            axesToTranspose(&x, bits);
+            return if (@as(u16, d) * bits <= 64) interleaveFast(d, u64, &x) else interleaveFast(d, u128, &x);
+        },
+        else => unreachable,
+    }
 }
 
 /// Runtime-space decode that validates its arguments. Writes `dims`
@@ -139,8 +179,15 @@ pub fn decodeChecked(dims: u8, bits: u8, index: u128, out: []u32) Error!void {
     if (out.len != dims) return error.DimensionsOutOfRange;
     const total: u16 = @as(u16, dims) * bits;
     if (total < 128 and index >> @intCast(total) != 0) return error.IndexOutOfRange;
-    deinterleave(u128, index, out, bits);
-    transposeToAxes(out, bits);
+    @setEvalBranchQuota(100_000);
+    switch (dims) {
+        inline 1...max_dims => |d| {
+            const x: *[d]u32 = out[0..d];
+            if (total <= 64) deinterleaveFast(d, u64, @intCast(index), x) else deinterleaveFast(d, u128, index, x);
+            transposeToAxes(x, bits);
+        },
+        else => unreachable,
+    }
 }
 
 fn expectCurve(comptime dims: u8, comptime bits: u8) !void {
@@ -171,6 +218,38 @@ fn expectCurve(comptime dims: u8, comptime bits: u8) !void {
 test "n-D curve is a continuous bijection starting at the origin" {
     inline for (.{ .{ 1, 4 }, .{ 2, 1 }, .{ 2, 5 }, .{ 3, 1 }, .{ 3, 4 }, .{ 4, 3 }, .{ 5, 2 }, .{ 6, 2 }, .{ 8, 1 }, .{ 12, 1 } }) |s| {
         try expectCurve(s[0], s[1]);
+    }
+}
+
+test "n-D matches Skilling's branching algorithm, including 128-bit spaces" {
+    const reference = @import("reference.zig");
+    var prng = std.Random.DefaultPrng.init(5);
+    const r = prng.random();
+    inline for (.{ .{ 4, 32 }, .{ 8, 16 }, .{ 32, 4 }, .{ 3, 21 }, .{ 16, 8 }, .{ 1, 32 }, .{ 2, 32 }, .{ 5, 25 } }) |s| {
+        const dims = s[0];
+        const bits = s[1];
+        for (0..2000) |_| {
+            var p: [dims]u32 = undefined;
+            for (&p) |*c| c.* = if (bits == 32) r.int(u32) else r.uintLessThan(u32, @as(u32, 1) << bits);
+            const want = reference.encodeNd(bits, &p);
+            try std.testing.expectEqual(want, encode(dims, bits, p));
+            try std.testing.expectEqual(want, try encodeChecked(dims, bits, &p));
+            var back: [dims]u32 = undefined;
+            reference.decodeNd(bits, want, &back);
+            try std.testing.expectEqualSlices(u32, &p, &back);
+            try std.testing.expectEqualSlices(u32, &p, &decode(dims, bits, @intCast(want)));
+        }
+    }
+    for (0..20_000) |_| {
+        const dims = r.intRangeAtMost(u8, 1, max_dims);
+        const bits = r.intRangeAtMost(u8, 1, @min(max_bits, max_index_bits / dims));
+        var p: [max_dims]u32 = undefined;
+        for (p[0..dims]) |*c| c.* = if (bits == 32) r.int(u32) else r.uintLessThan(u32, @as(u32, 1) << @intCast(bits));
+        const want = reference.encodeNd(bits, p[0..dims]);
+        try std.testing.expectEqual(want, try encodeChecked(dims, bits, p[0..dims]));
+        var back: [max_dims]u32 = undefined;
+        try decodeChecked(dims, bits, want, back[0..dims]);
+        try std.testing.expectEqualSlices(u32, p[0..dims], back[0..dims]);
     }
 }
 

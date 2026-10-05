@@ -52,7 +52,8 @@ fn decodeStep(state: u2, digit: u2) struct { bx: u1, by: u1, state: u2 } {
     };
 }
 
-/// Encode and decode tables for `chunk` bit levels per lookup.
+/// Encode and decode tables for `chunk` bit levels per lookup. Public for
+/// the benchmark and tests; the layout may change between versions.
 /// Encode index: `state << 2c | x_chunk << c | y_chunk`, value: `state' << 2c | digits`.
 /// Decode index: `state << 2c | digits`, value: `state' << 2c | x_chunk << c | y_chunk`.
 pub fn Tables(comptime chunk: u4) type {
@@ -68,6 +69,7 @@ pub fn Tables(comptime chunk: u4) type {
 
         fn build(comptime forward: bool) [entries]Entry {
             @setEvalBranchQuota(20_000_000);
+            if (chunk >= 2) return compose(forward);
             var table: [entries]Entry = undefined;
             const c: u5 = chunk;
             const low: u32 = (@as(u32, 1) << (2 * c)) - 1;
@@ -92,6 +94,42 @@ pub fn Tables(comptime chunk: u4) type {
                     }
                 }
                 table[i] = @intCast(out | (@as(u32, state) << (2 * c)));
+            }
+            return table;
+        }
+
+        /// Builds this table from the tables for the high `h` and low `l`
+        /// levels (`h + l = chunk`): two lookups per entry instead of
+        /// `chunk` steps, which keeps compile time down.
+        fn compose(comptime forward: bool) [entries]Entry {
+            @setEvalBranchQuota(20_000_000);
+            const h: u4 = chunk / 2;
+            const l: u4 = chunk - h;
+            const H = Tables(h);
+            const L = Tables(l);
+            const c: u5 = chunk;
+            const hm: u32 = (@as(u32, 1) << h) - 1;
+            const lm: u32 = (@as(u32, 1) << l) - 1;
+            var table: [entries]Entry = undefined;
+            for (0..entries) |i_| {
+                const i: u32 = @intCast(i_);
+                const state = i >> (2 * c);
+                if (forward) {
+                    const xs = (i >> c) & ((@as(u32, 1) << c) - 1);
+                    const ys = i & ((@as(u32, 1) << c) - 1);
+                    const e1: u32 = H.encode[(state << (2 * h)) | ((xs >> l) << h) | (ys >> l)];
+                    const e2: u32 = L.encode[((e1 >> (2 * h)) << (2 * l)) | ((xs & lm) << l) | (ys & lm)];
+                    const d1 = e1 & ((@as(u32, 1) << (2 * h)) - 1);
+                    const d2 = e2 & ((@as(u32, 1) << (2 * l)) - 1);
+                    table[i] = @intCast(((e2 >> (2 * l)) << (2 * c)) | (d1 << (2 * l)) | d2);
+                } else {
+                    const digits = i & ((@as(u32, 1) << (2 * c)) - 1);
+                    const e1: u32 = H.decode[(state << (2 * h)) | (digits >> (2 * l))];
+                    const e2: u32 = L.decode[((e1 >> (2 * h)) << (2 * l)) | (digits & ((@as(u32, 1) << (2 * l)) - 1))];
+                    const x = (((e1 >> h) & hm) << l) | ((e2 >> l) & lm);
+                    const y = ((e1 & hm) << l) | (e2 & lm);
+                    table[i] = @intCast(((e2 >> (2 * l)) << (2 * c)) | (x << c) | y);
+                }
             }
             return table;
         }
@@ -180,8 +218,9 @@ pub fn decodeChecked(bits: u6, index: u64) Error!Point {
     };
 }
 
-/// Branch-free per-bit encoder over `lanes` points at once. It maps to NEON
-/// on Apple Silicon; the benchmark compares it with the table encoder.
+/// Experimental: branch-free per-bit encoder over `lanes` points at once.
+/// It maps to NEON on Apple Silicon but is slower than `encode`; it is kept
+/// for the benchmark comparison and may change or be removed.
 pub inline fn encodeLanes(comptime lanes: comptime_int, comptime bits: u6, x: @Vector(lanes, u32), y: @Vector(lanes, u32)) @Vector(lanes, u64) {
     const V32 = @Vector(lanes, u32);
     const one: V32 = @splat(1);
