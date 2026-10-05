@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 - 2026-10-05
+
+- Fix: the package omitted `test/` and `examples/`, which `build.zig`
+  needs, so projects that depend on 0.1.0 failed to build. CI now builds a
+  consumer project from the packaged archive.
+
 ## 0.1.0 - 2026-10-05
 
 First release.

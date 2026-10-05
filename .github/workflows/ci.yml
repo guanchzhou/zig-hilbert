@@ -53,6 +53,51 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: zig build test --fuzz=50K
       - run: zig build perf-check
+      - name: Build a consumer project from the package
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          git archive --format=tar.gz --prefix=zig-hilbert/ -o "$RUNNER_TEMP/zig-hilbert.tar.gz" HEAD
+          mkdir "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          cat > build.zig.zon <<'EOF'
+          .{
+              .name = .zh_consumer,
+              .version = "0.0.0",
+              .fingerprint = 0xda899f64f3128b8,
+              .minimum_zig_version = "0.17.0",
+              .dependencies = .{},
+              .paths = .{""},
+          }
+          EOF
+          cat > build.zig <<'EOF'
+          const std = @import("std");
+          pub fn build(b: *std.Build) void {
+              const target = b.standardTargetOptions(.{});
+              const optimize = b.standardOptimizeOption(.{});
+              const dep = b.dependency("zig_hilbert", .{ .target = target, .optimize = optimize });
+              const exe = b.addExecutable(.{ .name = "consumer", .root_module = b.createModule(.{
+                  .root_source_file = b.path("main.zig"),
+                  .target = target,
+                  .optimize = optimize,
+                  .imports = &.{.{ .name = "hilbert", .module = dep.module("hilbert") }},
+              }) });
+              const run = b.addRunArtifact(exe);
+              run.expectStdOutEqual("1555040834\n");
+              b.step("run", "Run").dependOn(&run.step);
+          }
+          EOF
+          cat > main.zig <<'EOF'
+          const std = @import("std");
+          const hilbert = @import("hilbert");
+          pub fn main(init: std.process.Init) !void {
+              var buf: [32]u8 = undefined;
+              var out = std.Io.File.stdout().writerStreaming(init.io, &buf);
+              try out.interface.print("{d}\n", .{hilbert.encode2(16, 12345, 54321)});
+              try out.interface.flush();
+          }
+          EOF
+          zig fetch --save=zig_hilbert "$RUNNER_TEMP/zig-hilbert.tar.gz"
+          zig build run
       - name: Cross-compile
         if: matrix.os == 'ubuntu-latest'
         run: |

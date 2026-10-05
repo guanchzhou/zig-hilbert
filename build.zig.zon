@@ -1,6 +1,6 @@
 .{
     .name = .zig_hilbert,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0xb0cec768a9bca155,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
@@ -8,7 +8,10 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "test",
+        "examples",
         "LICENSE",
         "README.md",
+        "CHANGELOG.md",
     },
 }

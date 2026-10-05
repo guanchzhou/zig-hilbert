@@ -22,7 +22,7 @@ other.
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.1.0
+zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.1.1
 ```
 
 ```zig

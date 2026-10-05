@@ -76,7 +76,7 @@ pub const cases = [_]Case{
     .{ .name = "similar: same marker", .args = &.{ "similar", m, m }, .stdout = "64\n" },
     .{ .name = "similar: different spaces", .args = &.{ "similar", m, "hk1:8:8:0000000000000001:a0c28ad75ed48ca8" }, .stderr = "different spaces", .exit = 1 },
     .{ .name = "cell", .args = &.{ "cell", "hk1:2:4:9e3779b97f4a7c15:8a" }, .stdout = "11 11\n" },
-    .{ .name = "version", .args = &.{"version"}, .stdout = "zig-hilbert 0.1.0\n" },
+    .{ .name = "version", .args = &.{"version"}, .stdout = "zig-hilbert " ++ @import("../build.zig.zon").version ++ "\n" },
     .{ .name = "help", .args = &.{"--help"}, .stdout = null },
 
     .{ .name = "range: level 3", .args = &.{ "range", m, "3" }, .stdout = "hk1:8:8:9e3779b97f4a7c15:a0c28a0000000000 hk1:8:8:9e3779b97f4a7c15:a0c28affffffffff\n" },

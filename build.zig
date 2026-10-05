@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
         shared.setName("zig-hilbert: two runs appending to one stdout file");
         shared.addArtifactArg(cli);
         _ = shared.addOutputFileArg("stdout.txt");
-        shared.expectStdOutEqual("zig-hilbert 0.1.0\nzig-hilbert 0.1.0\n");
+        shared.expectStdOutEqual(b.fmt("zig-hilbert {0s}\nzig-hilbert {0s}\n", .{zon.version}));
         test_cli.dependOn(&shared.step);
     }
     test_step.dependOn(test_cli);
