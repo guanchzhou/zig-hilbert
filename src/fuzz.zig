@@ -1,5 +1,6 @@
-//! Fuzz targets. `zig build test` runs each once on its corpus;
-//! `zig build test --fuzz` explores further.
+//! Fuzz targets. `zig build test` runs every input in `src/fuzz-corpus/`;
+//! `zig build test --fuzz` explores further and keeps new inputs in the
+//! build cache. Copy any input that finds a bug back into the corpus.
 
 const std = @import("std");
 const curve2d = @import("curve2d.zig");
@@ -7,6 +8,95 @@ const curvend = @import("curvend.zig");
 const marker = @import("marker.zig");
 const reference = @import("reference.zig");
 const Smith = std.testing.Smith;
+
+const marker_corpus = [_][]const u8{
+    @embedFile("fuzz-corpus/marker/00"),
+    @embedFile("fuzz-corpus/marker/01"),
+    @embedFile("fuzz-corpus/marker/02"),
+    @embedFile("fuzz-corpus/marker/03"),
+    @embedFile("fuzz-corpus/marker/04"),
+    @embedFile("fuzz-corpus/marker/05"),
+    @embedFile("fuzz-corpus/marker/06"),
+    @embedFile("fuzz-corpus/marker/07"),
+    @embedFile("fuzz-corpus/marker/08"),
+    @embedFile("fuzz-corpus/marker/09"),
+    @embedFile("fuzz-corpus/marker/10"),
+    @embedFile("fuzz-corpus/marker/11"),
+    @embedFile("fuzz-corpus/marker/12"),
+    @embedFile("fuzz-corpus/marker/13"),
+};
+
+const checked2d_corpus = [_][]const u8{
+    @embedFile("fuzz-corpus/checked2d/00"),
+    @embedFile("fuzz-corpus/checked2d/01"),
+    @embedFile("fuzz-corpus/checked2d/02"),
+    @embedFile("fuzz-corpus/checked2d/03"),
+    @embedFile("fuzz-corpus/checked2d/04"),
+    @embedFile("fuzz-corpus/checked2d/05"),
+    @embedFile("fuzz-corpus/checked2d/06"),
+    @embedFile("fuzz-corpus/checked2d/07"),
+    @embedFile("fuzz-corpus/checked2d/08"),
+    @embedFile("fuzz-corpus/checked2d/09"),
+    @embedFile("fuzz-corpus/checked2d/10"),
+    @embedFile("fuzz-corpus/checked2d/11"),
+    @embedFile("fuzz-corpus/checked2d/12"),
+    @embedFile("fuzz-corpus/checked2d/13"),
+    @embedFile("fuzz-corpus/checked2d/14"),
+    @embedFile("fuzz-corpus/checked2d/15"),
+    @embedFile("fuzz-corpus/checked2d/16"),
+    @embedFile("fuzz-corpus/checked2d/17"),
+    @embedFile("fuzz-corpus/checked2d/18"),
+    @embedFile("fuzz-corpus/checked2d/19"),
+    @embedFile("fuzz-corpus/checked2d/20"),
+};
+
+const checkednd_corpus = [_][]const u8{
+    @embedFile("fuzz-corpus/checkednd/00"),
+    @embedFile("fuzz-corpus/checkednd/01"),
+    @embedFile("fuzz-corpus/checkednd/02"),
+    @embedFile("fuzz-corpus/checkednd/03"),
+    @embedFile("fuzz-corpus/checkednd/04"),
+    @embedFile("fuzz-corpus/checkednd/05"),
+    @embedFile("fuzz-corpus/checkednd/06"),
+    @embedFile("fuzz-corpus/checkednd/07"),
+    @embedFile("fuzz-corpus/checkednd/08"),
+    @embedFile("fuzz-corpus/checkednd/09"),
+    @embedFile("fuzz-corpus/checkednd/10"),
+    @embedFile("fuzz-corpus/checkednd/11"),
+    @embedFile("fuzz-corpus/checkednd/12"),
+    @embedFile("fuzz-corpus/checkednd/13"),
+    @embedFile("fuzz-corpus/checkednd/14"),
+    @embedFile("fuzz-corpus/checkednd/15"),
+    @embedFile("fuzz-corpus/checkednd/16"),
+    @embedFile("fuzz-corpus/checkednd/17"),
+    @embedFile("fuzz-corpus/checkednd/18"),
+    @embedFile("fuzz-corpus/checkednd/19"),
+    @embedFile("fuzz-corpus/checkednd/20"),
+};
+
+const range_corpus = [_][]const u8{
+    @embedFile("fuzz-corpus/range/00"),
+    @embedFile("fuzz-corpus/range/01"),
+    @embedFile("fuzz-corpus/range/02"),
+    @embedFile("fuzz-corpus/range/03"),
+    @embedFile("fuzz-corpus/range/04"),
+    @embedFile("fuzz-corpus/range/05"),
+    @embedFile("fuzz-corpus/range/06"),
+    @embedFile("fuzz-corpus/range/07"),
+    @embedFile("fuzz-corpus/range/08"),
+    @embedFile("fuzz-corpus/range/09"),
+    @embedFile("fuzz-corpus/range/10"),
+    @embedFile("fuzz-corpus/range/11"),
+    @embedFile("fuzz-corpus/range/12"),
+    @embedFile("fuzz-corpus/range/13"),
+    @embedFile("fuzz-corpus/range/14"),
+    @embedFile("fuzz-corpus/range/15"),
+    @embedFile("fuzz-corpus/range/16"),
+    @embedFile("fuzz-corpus/range/17"),
+    @embedFile("fuzz-corpus/range/18"),
+    @embedFile("fuzz-corpus/range/19"),
+    @embedFile("fuzz-corpus/range/20"),
+};
 
 fn parseThenFormat(_: void, smith: *Smith) anyerror!void {
     var buf: [marker.Marker.max_len + 8]u8 = undefined;
@@ -19,12 +109,7 @@ fn parseThenFormat(_: void, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: Marker.parse accepts only canonical text" {
-    try std.testing.fuzz({}, parseThenFormat, .{ .corpus = &.{
-        "hk1:8:8:9e3779b97f4a7c15:a0c28ad75ed48ca8",
-        "hk1:1:1:0000000000000000:1",
-        "hk1:32:4:ffffffffffffffff:ffffffffffffffffffffffffffffffff",
-        "hk1:08:8:9e3779b97f4a7c15:a0c28ad75ed48ca8",
-    } });
+    try std.testing.fuzz({}, parseThenFormat, .{ .corpus = &marker_corpus });
 }
 
 fn checked2d(_: void, smith: *Smith) anyerror!void {
@@ -46,7 +131,7 @@ fn checked2d(_: void, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: checked 2D encode and decode round-trip or reject" {
-    try std.testing.fuzz({}, checked2d, .{});
+    try std.testing.fuzz({}, checked2d, .{ .corpus = &checked2d_corpus });
 }
 
 fn checkedNd(_: void, smith: *Smith) anyerror!void {
@@ -68,7 +153,7 @@ fn checkedNd(_: void, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: checked n-D encode and decode round-trip or reject" {
-    try std.testing.fuzz({}, checkedNd, .{});
+    try std.testing.fuzz({}, checkedNd, .{ .corpus = &checkednd_corpus });
 }
 
 fn rangeNd(_: void, smith: *Smith) anyerror!void {
@@ -92,5 +177,5 @@ fn rangeNd(_: void, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: decodeRange equals decode index by index" {
-    try std.testing.fuzz({}, rangeNd, .{});
+    try std.testing.fuzz({}, rangeNd, .{ .corpus = &range_corpus });
 }
