@@ -18,6 +18,10 @@ const usage =
     \\        --probe: instead of the marker, up to N (default 8) "LO HI" marker
     \\        ranges covering the cell at LEVEL and its nearest neighbours
     \\        (jsonl adds "ranges":[["LO","HI"],...])
+    \\  zig-hilbert hk2 [--tables N] [--bits N] [--seed HEX] [--probes N] [--max-line BYTES]
+    \\        stdin: as for key; stdout (jsonl): {"id":...,"marker":"hk2:...","keys":["HEX",...]}
+    \\        multi-table angular LSH keys (default 16 tables of 8 bits); --probes N adds
+    \\        "probes":[["HEX",...],...], the N most likely keys of each table, own key first
     \\  zig-hilbert range MARKER LEVEL
     \\        stdout: "LO HI" markers bounding the cell that keeps LEVEL bits per axis
     \\  zig-hilbert similar MARKER MARKER
@@ -130,6 +134,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (eql(cmd, "key")) {
         try keyCommand(init, rest, out);
+    } else if (eql(cmd, "hk2")) {
+        try hk2Command(init, rest, out);
     } else if (eql(cmd, "range")) {
         if (rest.len != 2) fail("range takes MARKER LEVEL", .{});
         const r = parseMarker(rest[0]).range(parseInt(u8, rest[1], "level"));
@@ -324,6 +330,99 @@ fn keyCommand(init: std.process.Init, args: []const [:0]const u8, out: *std.Io.W
         }
     }
     if (block.rows() > 0) total += try flush(gpa, &block, &space.?, o, out);
+    if (total == 0) fail("no embeddings on stdin", .{});
+}
+
+fn hk2Command(init: std.process.Init, args: []const [:0]const u8, out: *std.Io.Writer) !void {
+    const gpa = init.gpa;
+    var tables: u16 = 16;
+    var bits: u8 = 8;
+    var seed: u64 = hilbert.marker.default_seed;
+    var n_probes: usize = 0;
+    var max_line: usize = default_max_line;
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        const name = args[i];
+        if (i + 1 >= args.len) fail("missing value for {s}", .{name});
+        const v = args[i + 1];
+        if (eql(name, "--tables")) {
+            tables = parseInt(u16, v, "tables");
+        } else if (eql(name, "--bits")) {
+            bits = parseInt(u8, v, "bits");
+        } else if (eql(name, "--seed")) {
+            seed = std.fmt.parseInt(u64, v, 16) catch fail("invalid seed: {s}", .{v});
+        } else if (eql(name, "--probes")) {
+            n_probes = parseInt(usize, v, "probes");
+            if (n_probes == 0 or n_probes > 256) fail("--probes must be between 1 and 256", .{});
+        } else if (eql(name, "--max-line")) {
+            max_line = parseInt(usize, v, "max-line");
+        } else fail("unknown option {s}", .{name});
+    }
+    const space = hilbert.hk2.Space.init(tables, bits, seed) catch |e| fail("{s}", .{@errorName(e)});
+    const in_buf = try gpa.alloc(u8, max_line);
+    defer gpa.free(in_buf);
+    var stdin = std.Io.File.stdin().readerStreaming(init.io, in_buf);
+    const keys = try gpa.alloc(u64, tables);
+    defer gpa.free(keys);
+    const margins = try gpa.alloc(f64, @as(usize, tables) * bits);
+    defer gpa.free(margins);
+    const marker_buf = try gpa.alloc(u8, space.markerLen());
+    defer gpa.free(marker_buf);
+    var probe_buf: [256]u64 = undefined;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var width: usize = 0;
+    var line_no: usize = 0;
+    var total: usize = 0;
+    const digits = (bits + 3) / 4;
+    while (true) {
+        const raw = stdin.interface.takeDelimiter('\n') catch |e| switch (e) {
+            error.StreamTooLong => fail("line {d}: longer than {d} bytes (see --max-line)", .{ line_no + 1, max_line }),
+            error.ReadFailed => return stdin.err.?,
+        } orelse break;
+        line_no += 1;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        _ = arena.reset(.retain_capacity);
+        const parsed = parseRow(gpa, line) catch
+            fail("line {d}: expected a JSON array of numbers or an object with \"embedding\"", .{line_no});
+        defer parsed.deinit();
+        const row = parsed.value;
+        if (width == 0) width = row.embedding.len;
+        if (row.embedding.len == 0 or row.embedding.len != width)
+            fail("line {d}: expected {d} numbers, got {d}", .{ line_no, width, row.embedding.len });
+        space.keys(row.embedding, keys, margins) catch |e| fail("line {d}: {s}", .{ line_no, @errorName(e) });
+        const id = try idText(arena.allocator(), row.id, .jsonl, line_no);
+        try out.writeAll("{");
+        if (id.len > 0) try out.print("\"id\":{s},", .{id});
+        try out.print("\"marker\":\"{s}\",\"keys\":[", .{try space.format(keys, marker_buf)});
+        for (keys, 0..) |k, t| {
+            if (t > 0) try out.writeAll(",");
+            try out.writeAll("\"");
+            try out.printInt(k, 16, .lower, .{ .width = digits, .fill = '0' });
+            try out.writeAll("\"");
+        }
+        try out.writeAll("]");
+        if (n_probes > 0) {
+            try out.writeAll(",\"probes\":[");
+            for (keys, 0..) |k, t| {
+                if (t > 0) try out.writeAll(",");
+                const got = hilbert.hk2.probes(margins[t * bits ..][0..bits], k, probe_buf[0..n_probes]);
+                try out.writeAll("[");
+                for (probe_buf[0..got], 0..) |p, j| {
+                    if (j > 0) try out.writeAll(",");
+                    try out.writeAll("\"");
+                    try out.printInt(p, 16, .lower, .{ .width = digits, .fill = '0' });
+                    try out.writeAll("\"");
+                }
+                try out.writeAll("]");
+            }
+            try out.writeAll("]");
+        }
+        try out.writeAll("}\n");
+        total += 1;
+    }
+    try out.flush();
     if (total == 0) fail("no embeddings on stdin", .{});
 }
 

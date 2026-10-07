@@ -15,6 +15,7 @@ pub const curve2d = @import("curve2d.zig");
 pub const curvend = @import("curvend.zig");
 pub const batch = @import("batch.zig");
 pub const marker = @import("marker.zig");
+pub const hk2 = @import("hk2.zig");
 pub const parallel = @import("parallel.zig");
 pub const reference = @import("reference.zig");
 pub const s2 = @import("s2.zig");
@@ -50,6 +51,7 @@ test {
     _ = parallel;
     _ = batch;
     _ = marker;
+    _ = hk2;
     _ = s2;
     _ = @import("fuzz.zig");
 }

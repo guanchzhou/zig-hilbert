@@ -14,6 +14,25 @@ const m = "hk1:8:8:9e3779b97f4a7c15:a0c28ad75ed48ca8";
 
 pub const cases = [_]Case{
     .{
+        .name = "hk2: keys and probes",
+        .args = &.{ "hk2", "--tables", "3", "--bits", "4", "--probes", "3" },
+        .stdin = "[1,2,3,-1]\n",
+        .stdout = "{\"marker\":\"hk2:3:4:9e3779b97f4a7c15:7.1.a\",\"keys\":[\"7\",\"1\",\"a\"],\"probes\":[[\"7\",\"3\",\"f\"],[\"1\",\"0\",\"5\"],[\"a\",\"e\",\"b\"]]}\n",
+    },
+    .{
+        .name = "hk2: id in the output",
+        .args = &.{ "hk2", "--tables", "2", "--bits", "6" },
+        .stdin = "{\"id\":\"a\",\"embedding\":[0.5,-0.2,0.1]}\n",
+        .stdout = "{\"id\":\"a\",\"marker\":\"hk2:2:6:9e3779b97f4a7c15:3f.23\",\"keys\":[\"3f\",\"23\"]}\n",
+    },
+    .{
+        .name = "hk2: zero vector",
+        .args = &.{"hk2"},
+        .stdin = "[0,0]\n",
+        .stderr = "ZeroVector",
+        .exit = 1,
+    },
+    .{
         .name = "key: default space",
         .args = &.{"key"},
         .stdin = "[1,2,3]\n[3,2,1]\n",
