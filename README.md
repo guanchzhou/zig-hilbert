@@ -22,7 +22,7 @@ other.
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.2.1
+zig fetch --save git+https://github.com/guanchzhou/zig-hilbert#v0.3.0
 ```
 
 ```zig
@@ -189,6 +189,30 @@ Here is how often a neighbour with cosine similarity about 0.96 was found
 
 Lower levels keep more candidates per range. Pick the level by how many rows
 a cell holds in your data, and the range budget by how much recall you need.
+
+### Many independent keys: hk2
+
+One hk1 key is one hash table: two vectors at angle θ share a level-1 cell
+with probability close to `(1 - θ/π)^8`. When questions and answers are far
+apart in angle, no single key brings them together. `hk2` stores `L`
+independent keys of `b` sign bits each, so a pair collides in at least one
+table with probability `1 - (1 - (1 - θ/π)^b)^L`, and `hilbert.hk2.probes`
+adds query-directed multi-probe (Lv et al. 2007): the next most likely keys
+of a table, flipping the bits whose projections are closest to zero first.
+
+```sh
+$ echo '[1,2,3,-1]' | zig-hilbert hk2 --tables 3 --bits 4 --probes 3
+{"marker":"hk2:3:4:9e3779b97f4a7c15:7.1.a","keys":["7","1","a"],"probes":[["7","3","f"],["1","0","5"],["a","e","b"]]}
+```
+
+hk1 markers are unchanged. On 810 question-and-answer pairs of a personal
+note corpus (1024-dimensional embeddings, centred on the corpus mean), the
+share of pairs colliding in at least one of `L` 8-bit tables followed the
+formula at every `L` tried, from 1 to 128 tables (0.84 observed against 0.83
+predicted at 71 tables, 0.92 against 0.93 at 128). Reaching 90% took between
+96 and 128 tables, and at that point a query shared a bucket with about 40%
+of all chunks, so for this kind of data hashing saves little over reading
+every vector. Measure your own pairs before relying on it.
 
 ### In a database
 

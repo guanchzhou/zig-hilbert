@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 - 2026-10-07
+
+- `hilbert.hk2`: multi-table angular LSH keys next to hk1. `Space.keys`
+  returns one `bits`-bit sign key per table from seeded +-1 hyperplanes, with
+  the projections for multi-probe; `probes` lists a table's most likely keys
+  in order of the summed |projection| of the flipped bits (Lv et al. 2007).
+  Markers are `hk2:<tables>:<bits>:<seed>:<key>.<key>...`, with `format` and
+  `parse`. hk1 keys and markers are bit-identical to 0.2.1.
+- The `zig-hilbert` command accepts `hk2 [--tables N] [--bits N] [--seed HEX]
+  [--probes N]`.
+
 ## 0.2.1 - 2026-10-05
 
 - `hilbert.s2.cover`, `coverCap`, `coverPolyline`, and `coverPolygon` cover
