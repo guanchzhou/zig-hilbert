@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.0
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            archive: zig-hilbert-linux-amd64
+          - target: aarch64-linux-musl
+            archive: zig-hilbert-linux-arm64
+          - target: x86_64-macos
+            archive: zig-hilbert-darwin-amd64
+          - target: aarch64-macos
+            archive: zig-hilbert-darwin-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        run: |
+          name="zig-x86_64-linux-$ZIG_VERSION"
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/$name.tar.xz" -o zig.tar.xz
+          echo "$ZIG_SHA256  zig.tar.xz" | shasum -a 256 -c -
+          tar -xf zig.tar.xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          zig build -Dtarget="$TARGET" -Doptimize=ReleaseFast
+          mkdir -p dist
+          cp zig-out/bin/zig-hilbert LICENSE README.md CHANGELOG.md dist/
+          tar -czf "${ARCHIVE}.tar.gz" -C dist zig-hilbert LICENSE README.md CHANGELOG.md
+          shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.tar.gz
+            ${{ matrix.archive }}.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd artifacts
+          cat *.sha256 > SHA256SUMS
+          gh release create "$TAG" *.tar.gz SHA256SUMS --generate-notes --verify-tag

@@ -21,11 +21,13 @@
 
 const std = @import("std");
 const marker = @import("marker.zig");
+const parallel = @import("parallel.zig");
 
 pub const max_tables = 1024;
 pub const max_bits = 64;
+pub const min_rows_per_thread = 64;
 
-pub const Error = error{ BitsOutOfRange, TablesOutOfRange, ZeroVector, NonFiniteValue, OutputLengthMismatch };
+pub const Error = error{ BitsOutOfRange, TablesOutOfRange, ZeroVector, NonFiniteValue, OutputLengthMismatch, DimensionMismatch };
 pub const ParseError = error{InvalidMarker};
 
 pub const Space = struct {
@@ -54,21 +56,94 @@ pub const Space = struct {
             nonzero = nonzero or x != 0;
         }
         if (!nonzero) return error.ZeroVector;
-        var acc: [max_bits]f64 = undefined;
+        const V8 = @Vector(8, f64);
+        const U8 = @Vector(8, u64);
+        const shifts: @Vector(8, u6) = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        const ones: U8 = @splat(1);
+        const zeros_u: U8 = @splat(0);
+        const blocks = (@as(usize, s.bits) + 7) / 8;
+        var acc_vec: [max_bits / 8]V8 = undefined;
         for (0..s.tables) |t| {
             const seed_t = marker.splitmix64(s.seed, t);
-            @memset(acc[0..s.bits], 0);
+            for (acc_vec[0..blocks]) |*av| av.* = @splat(0);
             for (e, 0..) |x, i| {
                 const w = marker.splitmix64(seed_t, i);
                 const v: f64 = x;
-                for (0..s.bits) |j| acc[j] += if ((w >> @intCast(j)) & 1 == 1) -v else v;
+                const pos_v: V8 = @splat(v);
+                const neg_v: V8 = @splat(-v);
+                for (0..blocks) |blk| {
+                    const chunk: U8 = @splat(w >> @intCast(blk * 8));
+                    const is_neg = ((chunk >> shifts) & ones) != zeros_u;
+                    acc_vec[blk] += @select(f64, is_neg, neg_v, pos_v);
+                }
             }
+            const acc: *const [max_bits]f64 = @ptrCast(&acc_vec);
             var key: u64 = 0;
             for (0..s.bits) |j| {
                 if (acc[j] > 0) key |= @as(u64, 1) << @intCast(j);
             }
             out[t] = key;
             if (margins) |m| @memcpy(m[t * s.bits ..][0..s.bits], acc[0..s.bits]);
+        }
+    }
+
+    /// Multi-threaded batch encoding of `embeddings` (row-major, `input_dims`
+    /// floats per row) into `out` (`rows * tables` u64 keys). `exec` is a
+    /// thread count (0 = one per core) or a `std.Io`.
+    pub fn keysBatch(
+        s: Space,
+        embeddings: []const f32,
+        input_dims: usize,
+        out: []u64,
+        exec: anytype,
+        failed_row: ?*usize,
+    ) (Error || parallel.ExecError(@TypeOf(exec)))!void {
+        if (input_dims == 0) return error.DimensionMismatch;
+        if (out.len % s.tables != 0) return error.OutputLengthMismatch;
+        const rows = out.len / s.tables;
+        if (embeddings.len != rows * input_dims) return error.DimensionMismatch;
+
+        const Ctx = struct {
+            space: Space,
+            rows: []const f32,
+            input_dims: usize,
+            out: []u64,
+            failed_row: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+            failure: Error = undefined,
+            mutex: std.atomic.Mutex = .unlocked,
+
+            fn run(ctx: *@This(), start: usize, end: usize) void {
+                const width = ctx.input_dims;
+                const tables: usize = ctx.space.tables;
+                for (start..end) |r| {
+                    ctx.space.keys(
+                        ctx.rows[r * width ..][0..width],
+                        ctx.out[r * tables ..][0..tables],
+                        null,
+                    ) catch |err| return ctx.record(r, err);
+                }
+            }
+
+            fn record(ctx: *@This(), row: usize, err: Error) void {
+                while (!ctx.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer ctx.mutex.unlock();
+                if (row < ctx.failed_row.load(.monotonic)) {
+                    ctx.failed_row.store(row, .monotonic);
+                    ctx.failure = err;
+                }
+            }
+        };
+        var ctx: Ctx = .{
+            .space = s,
+            .rows = embeddings,
+            .input_dims = input_dims,
+            .out = out,
+        };
+        try parallel.run(exec, rows, min_rows_per_thread, &ctx, Ctx.run);
+        const row = ctx.failed_row.load(.monotonic);
+        if (row != std.math.maxInt(usize)) {
+            if (failed_row) |f| f.* = row;
+            return ctx.failure;
         }
     }
 
@@ -279,4 +354,29 @@ test "marker round trip" {
     try std.testing.expectError(error.InvalidMarker, parse("hk2:3:10:9e3779b97f4a7c15:3ff.000", &back));
     try std.testing.expectError(error.InvalidMarker, parse("hk2:3:10:9e3779b97f4a7c15:3ff.000.fff", &back));
     try std.testing.expectError(error.InvalidMarker, parse("hk1:3:10:9e3779b97f4a7c15:3ff.000.2a5", &back));
+}
+
+test "keysBatch matches single keys across threads and std.Io" {
+    const d = 16;
+    const rows = 4 * min_rows_per_thread + 5;
+    const s = try Space.init(4, 12, marker.default_seed);
+    const data = try std.testing.allocator.alloc(f32, rows * d);
+    defer std.testing.allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(42);
+    for (data) |*v| v.* = prng.random().floatNorm(f32);
+
+    const out = try std.testing.allocator.alloc(u64, rows * s.tables);
+    defer std.testing.allocator.free(out);
+    try s.keysBatch(data, d, out, 4, null);
+
+    var single: [4]u64 = undefined;
+    for (0..rows) |r| {
+        try s.keys(data[r * d ..][0..d], &single, null);
+        try std.testing.expectEqualSlices(u64, &single, out[r * s.tables ..][0..s.tables]);
+    }
+
+    const via_io = try std.testing.allocator.alloc(u64, rows * s.tables);
+    defer std.testing.allocator.free(via_io);
+    try s.keysBatch(data, d, via_io, std.testing.io, null);
+    try std.testing.expectEqualSlices(u64, out, via_io);
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-10-20
+
+- Vectorised `hk2.Space.keys` hyperplane projections with 8-lane `@Vector(8, f64)` `@select` accumulation, preserving bit-identical keys and projections.
+- Added `hk2.Space.keysBatch` for multi-threaded and `std.Io`-backed batch encoding.
+- Added cross-target release workflow (`release.yml`) with `SHA256SUMS`.
+
 ## 0.3.0 - 2026-10-07
 
 - `hilbert.hk2`: multi-table angular LSH keys next to hk1. `Space.keys`
