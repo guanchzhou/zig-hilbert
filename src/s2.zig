@@ -22,6 +22,7 @@ pub const Error = error{
     BufferTooSmall,
     CoverOptionsOutOfRange,
     RegionOutOfRange,
+    CoverTooLarge,
 };
 
 pub const LatLng = struct { lat: f64, lng: f64 };
@@ -44,7 +45,7 @@ pub const Cell = struct {
 
     pub fn level(self: Cell) u8 {
         if (self.id == 0) return 0;
-        return max_level - @as(u8, @intCast(@ctz(self.id) >> 1));
+        return max_level -| @as(u8, @intCast(@ctz(self.id) >> 1));
     }
 
     pub fn valid(self: Cell) bool {
@@ -72,8 +73,10 @@ pub const Cell = struct {
         return .{ self.child(0), self.child(1), self.child(2), self.child(3) };
     }
 
+    /// Id 0 (`fromToken("X")`) is not a cell; its range holds only id 0.
     pub fn range(self: Cell) Range {
         const bit = lsb(self.id);
+        if (bit == 0) return .{ .lo = 0, .hi = 0 };
         return .{ .lo = self.id - (bit - 1), .hi = self.id + (bit - 1) };
     }
 
@@ -143,8 +146,10 @@ pub const Cell = struct {
     }
 
     /// Snaps `pos` to the center of the cell at `level` that contains it.
+    /// `face` is at most 5 and `pos` fits in 61 bits.
     pub fn fromFacePosLevel(face_: u3, pos_: u64, level_: u8) Error!Cell {
         if (level_ > max_level) return error.LevelOutOfRange;
+        if (face_ > 5 or pos_ >> 61 != 0) return error.InvalidCell;
         const cell: Cell = .{ .id = (@as(u64, face_) << 61) + (pos_ | 1) };
         return cell.parent(level_);
     }
@@ -252,8 +257,11 @@ pub const Region = struct {
 const max_cover_scratch = 2048;
 
 /// Cells covering `region`, sorted by id. `out` must hold at least
-/// `max(opts.max_cells, 6)` cells. Each edge of a polyline or polygon is the
-/// shorter arc between its endpoints.
+/// `max(opts.max_cells, 6)` cells, and more with `min_level`, which can
+/// exceed `max_cells`. Each edge of a polyline or polygon is the shorter arc
+/// between its endpoints. Every intersecting cell above `min_level` is
+/// expanded in a fixed 2048-cell queue; a region that meets more cells than
+/// that at `min_level` returns `error.CoverTooLarge`.
 pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
     if (opts.max_cells == 0 or opts.min_level > opts.max_level or opts.max_level > max_level) {
         return error.CoverOptionsOutOfRange;
@@ -282,7 +290,7 @@ pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
         if (cell.level() < opts.min_level) {
             for (cell.children()) |child_| {
                 if (!region.mayIntersect(region.ctx, child_)) continue;
-                if (n >= scratch.len) return error.BufferTooSmall;
+                if (n >= scratch.len) return error.CoverTooLarge;
                 scratch[n] = child_;
                 n += 1;
             }
@@ -326,10 +334,12 @@ pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
     return out[0..result_n];
 }
 
-/// Merge `cells` (sorted by id) into inclusive id ranges.
+/// Merge `cells` (sorted by id) into inclusive id ranges. Every cell must be
+/// valid.
 pub fn mergeRanges(cells: []const Cell, out: []Range) Error![]Range {
     var n: usize = 0;
     for (cells) |cell| {
+        if (!cell.valid()) return error.InvalidCell;
         const r = cell.range();
         if (n > 0 and r.lo <= out[n - 1].hi +% 1) {
             out[n - 1].hi = @max(out[n - 1].hi, r.hi);
@@ -373,7 +383,7 @@ fn lsb(id: u64) u64 {
 }
 
 fn lsbForLevel(level_: u8) u64 {
-    return @as(u64, 1) << @intCast(2 * (@as(u8, max_level) - level_));
+    return @as(u64, 1) << @intCast(2 * (@as(u8, max_level) -| level_));
 }
 
 fn sizeIJ(level_: u8) i32 {
@@ -952,4 +962,39 @@ test "region covers contain the cap, the line, and the polygon" {
 
     try std.testing.expectError(error.CoverOptionsOutOfRange, coverCap(0, 0, 1, .{ .min_level = 3, .max_level = 1 }, &out));
     try std.testing.expectError(error.BufferTooSmall, coverCap(0, 0, 1, opts, out[0..0]));
+}
+
+test "fromFacePosLevel rejects a face or position outside the cube" {
+    try std.testing.expectError(error.InvalidCell, Cell.fromFacePosLevel(6, 0, 10));
+    try std.testing.expectError(error.InvalidCell, Cell.fromFacePosLevel(7, 0, 10));
+    try std.testing.expectError(error.InvalidCell, Cell.fromFacePosLevel(0, @as(u64, 1) << 61, 10));
+    try std.testing.expectError(error.InvalidCell, Cell.fromFacePosLevel(5, std.math.maxInt(u64), 30));
+    const last = try Cell.fromFacePosLevel(5, (@as(u64, 1) << 61) - 1, 30);
+    try std.testing.expect(last.valid() and last.leaf() and last.face() == 5);
+}
+
+test "id 0 is safe to range, contain, and merge" {
+    const zero = try fromToken("X");
+    try std.testing.expectEqual(Range{ .lo = 0, .hi = 0 }, zero.range());
+    try std.testing.expect(zero.contains(zero));
+    try std.testing.expect(!zero.contains(Cell.fromFace(0)));
+    try std.testing.expect(!Cell.fromFace(0).contains(zero));
+    var ranges: [2]Range = undefined;
+    try std.testing.expectError(error.InvalidCell, mergeRanges(&.{zero}, &ranges));
+    try std.testing.expectError(error.InvalidCell, mergeRanges(&.{ Cell.fromFace(0), .{ .id = 3 << 61 | 1 << 59 } }, &ranges));
+    try std.testing.expectError(error.InvalidCell, mergeRanges(&.{.{ .id = 7 << 61 | 1 }}, &ranges));
+}
+
+test "level and parent saturate on ids outside the documented domain" {
+    const bad: Cell = .{ .id = 1 << 62 };
+    try std.testing.expect(!bad.valid());
+    try std.testing.expectEqual(@as(u8, 0), bad.level());
+    const leaf_ = try fromLatLng(1, 2);
+    try std.testing.expectEqual(leaf_.id, leaf_.parent(255).id);
+}
+
+test "a min_level beyond the expansion queue is a clear error" {
+    var out: [8]Cell = undefined;
+    const opts = CoverOptions{ .min_level = 6, .max_level = 6 };
+    try std.testing.expectError(error.CoverTooLarge, coverCap(0, 0, earth_radius_m * 4, opts, &out));
 }

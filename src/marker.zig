@@ -112,8 +112,8 @@ pub const Marker = struct {
     pub fn parse(text: []const u8) ParseError!Marker {
         if (text.len > max_len or !std.mem.startsWith(u8, text, prefix)) return error.InvalidMarker;
         var it = std.mem.splitScalar(u8, text[prefix.len..], ':');
-        const dims = try parseDecimal(it.next() orelse return error.InvalidMarker);
-        const bits = try parseDecimal(it.next() orelse return error.InvalidMarker);
+        const dims = try parseDecimal(u8, it.next() orelse return error.InvalidMarker);
+        const bits = try parseDecimal(u8, it.next() orelse return error.InvalidMarker);
         const seed_text = it.next() orelse return error.InvalidMarker;
         const key_text = it.next() orelse return error.InvalidMarker;
         if (it.next() != null) return error.InvalidMarker;
@@ -173,18 +173,20 @@ fn writeHex(buf: []u8, value: anytype) void {
     }
 }
 
-fn parseDecimal(text: []const u8) ParseError!u8 {
-    if (text.len == 0 or text.len > 2) return error.InvalidMarker;
-    if (text.len == 2 and text[0] == '0') return error.InvalidMarker;
-    var v: u8 = 0;
+/// Plain decimal digits with no sign, separator, or leading zero.
+pub fn parseDecimal(comptime T: type, text: []const u8) ParseError!T {
+    if (text.len == 0 or (text.len > 1 and text[0] == '0')) return error.InvalidMarker;
+    var v: T = 0;
     for (text) |c| {
         if (c < '0' or c > '9') return error.InvalidMarker;
-        v = v * 10 + (c - '0');
+        v = std.math.mul(T, v, 10) catch return error.InvalidMarker;
+        v = std.math.add(T, v, c - '0') catch return error.InvalidMarker;
     }
     return v;
 }
 
-fn parseHex(text: []const u8) ParseError!u128 {
+/// 1 to 32 lowercase hex digits.
+pub fn parseHex(text: []const u8) ParseError!u128 {
     if (text.len == 0 or text.len > 32) return error.InvalidMarker;
     var v: u128 = 0;
     for (text) |c| {

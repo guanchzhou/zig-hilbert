@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 - 2026-10-25
+
+- `s2.Cell.fromFacePosLevel` returns `error.InvalidCell` for a face above 5 or a position wider than 61 bits instead of overflowing.
+- `s2.Cell.range` and `contains` are safe for id 0 (`fromToken("X")`), whose range holds only itself; `s2.mergeRanges` returns `error.InvalidCell` for an invalid cell. `Cell.level` and `Cell.parent` saturate instead of underflowing on ids and levels outside their domain.
+- `s2.cover` returns the new `error.CoverTooLarge`, not `error.BufferTooSmall`, when `min_level` needs more than its 2048-cell expansion queue.
+- `hk2.parse` uses the same strict decimal and hex parsing as hk1 markers, rejecting signs, `_` separators, leading zeros and uppercase hex, so it only accepts what `Space.format` writes.
+- `hk2.probes` uses at most the first 64 margins, writes just the key for an empty slice, and treats NaN margins as the most certain bits instead of writing past its stack buffers.
+
 ## 0.3.1 - 2026-10-20
 
 - Vectorised `hk2.Space.keys` hyperplane projections with 8-lane `@Vector(8, f64)` `@select` accumulation, preserving bit-identical keys and projections.

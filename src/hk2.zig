@@ -168,15 +168,17 @@ pub const Space = struct {
     }
 };
 
-/// Parses a marker; the keys go into `out`, which must hold `tables` keys.
+/// Strict inverse of `Space.format`: rejects signs, separators, leading zeros
+/// in the decimal fields, and uppercase hex. The keys go into `out`, which
+/// must hold `tables` keys.
 pub fn parse(text: []const u8, out: []u64) ParseError!Space {
     var it = std.mem.splitScalar(u8, text, ':');
     if (!std.mem.eql(u8, it.next() orelse "", "hk2")) return error.InvalidMarker;
-    const tables = std.fmt.parseInt(u16, it.next() orelse "", 10) catch return error.InvalidMarker;
-    const bits = std.fmt.parseInt(u8, it.next() orelse "", 10) catch return error.InvalidMarker;
+    const tables = try marker.parseDecimal(u16, it.next() orelse "");
+    const bits = try marker.parseDecimal(u8, it.next() orelse "");
     const seed_text = it.next() orelse "";
     if (seed_text.len != 16) return error.InvalidMarker;
-    const seed = std.fmt.parseInt(u64, seed_text, 16) catch return error.InvalidMarker;
+    const seed: u64 = @intCast(try marker.parseHex(seed_text));
     const s = Space.init(tables, bits, seed) catch return error.InvalidMarker;
     const body = it.next() orelse return error.InvalidMarker;
     if (it.next() != null or out.len != tables) return error.InvalidMarker;
@@ -185,7 +187,7 @@ pub fn parse(text: []const u8, out: []u64) ParseError!Space {
     var n: usize = 0;
     while (parts.next()) |p| : (n += 1) {
         if (n == tables or p.len != digits) return error.InvalidMarker;
-        const k = std.fmt.parseInt(u64, p, 16) catch return error.InvalidMarker;
+        const k: u64 = @intCast(try marker.parseHex(p));
         if (k & ~s.mask() != 0) return error.InvalidMarker;
         out[n] = k;
     }
@@ -196,23 +198,25 @@ pub fn parse(text: []const u8, out: []u64) ParseError!Space {
 /// Query-directed probes of one table (Lv et al. 2007): `out[0]` is `key`,
 /// then keys with bits flipped, in increasing order of the summed |margin|
 /// of the flipped bits. Returns how many were written (at most `out.len`,
-/// at most 2^bits). `margins` are that table's projections.
+/// at most 2^bits). `margins` are that table's projections; a key has 64
+/// bits, so only the first 64 are used. A NaN margin counts as infinitely
+/// certain and is flipped last.
 pub fn probes(margins: []const f64, key: u64, out: []u64) usize {
-    const bits = margins.len;
-    std.debug.assert(bits > 0 and bits <= max_bits);
+    const bits = @min(margins.len, max_bits);
     if (out.len == 0) return 0;
     out[0] = key;
+    if (bits == 0) return 1;
+    var z: [max_bits]f64 = undefined;
+    for (z[0..bits], margins[0..bits]) |*v, m| v.* = if (std.math.isNan(m)) std.math.inf(f64) else @abs(m);
     var order: [max_bits]u8 = undefined;
     for (0..bits) |i| order[i] = @intCast(i);
-    std.mem.sort(u8, order[0..bits], margins, struct {
+    std.mem.sort(u8, order[0..bits], @as([]const f64, z[0..bits]), struct {
         fn f(m: []const f64, a: u8, b: u8) bool {
-            const x = @abs(m[a]);
-            const y = @abs(m[b]);
-            return x < y or (x == y and a < b);
+            return m[a] < m[b] or (m[a] == m[b] and a < b);
         }
     }.f);
-    var z: [max_bits]f64 = undefined;
-    for (0..bits) |i| z[i] = @abs(margins[order[i]]);
+    const by_bit = z;
+    for (0..bits) |i| z[i] = by_bit[order[i]];
 
     // Candidate perturbation sets over sorted positions, as bit masks; a set's
     // largest position drives the shift and expand steps.
@@ -379,4 +383,50 @@ test "keysBatch matches single keys across threads and std.Io" {
     defer std.testing.allocator.free(via_io);
     try s.keysBatch(data, d, via_io, std.testing.io, null);
     try std.testing.expectEqualSlices(u64, out, via_io);
+}
+
+test "parse rejects text that format never writes" {
+    var back: [3]u64 = undefined;
+    const bad = [_][]const u8{
+        "hk2:+3:10:9e3779b97f4a7c15:3ff.000.2a5",
+        "hk2:03:10:9e3779b97f4a7c15:3ff.000.2a5",
+        "hk2:3:+10:9e3779b97f4a7c15:3ff.000.2a5",
+        "hk2:3:1_0:9e3779b97f4a7c15:3ff.000.2a5",
+        "hk2:3:10:9E3779B97F4A7C15:3ff.000.2a5",
+        "hk2:3:10:+e3779b97f4a7c15:3ff.000.2a5",
+        "hk2:3:10:9e3779b97f4a7c15:3FF.000.2a5",
+        "hk2:3:10:9e3779b97f4a7c15:+ff.000.2a5",
+        "hk2:3:10:9e3779b97f4a7c15:0_f.000.2a5",
+        "hk2:3:10:9e3779b97f4a7c1_:3ff.000.2a5",
+        "hk2:3:99999:9e3779b97f4a7c15:3ff.000.2a5",
+    };
+    for (bad) |text| try std.testing.expectError(error.InvalidMarker, parse(text, &back));
+    var one: [1]u64 = undefined;
+    try std.testing.expectError(error.InvalidMarker, parse("hk2:1:4:9e3779b97f4a7c15:+4", &one));
+    try std.testing.expectError(error.InvalidMarker, parse("hk2:1:8:9e3779b97f4a7c15:0_ab", &one));
+    try std.testing.expectError(error.InvalidMarker, parse("hk2:1:8:9e3779b97f4a7c15:AB", &one));
+    _ = try parse("hk2:1:8:9e3779b97f4a7c15:ab", &one);
+    try std.testing.expectEqual(@as(u64, 0xab), one[0]);
+}
+
+test "probes clamp to 64 margins and survive empty and NaN margins" {
+    var out: [8]u64 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), probes(&.{}, 7, &out));
+    try std.testing.expectEqual(@as(u64, 7), out[0]);
+
+    var wide: [100]f64 = undefined;
+    for (&wide, 0..) |*m, i| m.* = 1 + @as(f64, @floatFromInt(i));
+    wide[80] = 0.01;
+    try std.testing.expectEqual(@as(usize, 8), probes(&wide, 0, &out));
+    try std.testing.expectEqual(@as(u64, 1), out[1]);
+    var first64: [8]u64 = undefined;
+    _ = probes(wide[0..64], 0, &first64);
+    try std.testing.expectEqualSlices(u64, &first64, &out);
+
+    const nan = std.math.nan(f64);
+    const m = [_]f64{ nan, 0.2, nan, 0.1 };
+    try std.testing.expectEqual(@as(usize, 8), probes(&m, 0, &out));
+    try std.testing.expectEqual(@as(u64, 0b1000), out[1]);
+    try std.testing.expectEqual(@as(u64, 0b0010), out[2]);
+    for (out, 0..) |a, i| for (out[0..i]) |b| try std.testing.expect(a != b);
 }
