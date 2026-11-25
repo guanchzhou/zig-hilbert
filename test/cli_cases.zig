@@ -12,6 +12,16 @@ pub const Case = struct {
 
 const m = "hk1:8:8:9e3779b97f4a7c15:a0c28ad75ed48ca8";
 
+const too_many_points = blk: {
+    @setEvalBranchQuota(10000);
+    const line = "0 0\n";
+    var buf: [line.len * 4098]u8 = undefined;
+    for (0..4098) |i| {
+        @memcpy(buf[i * line.len ..][0..line.len], line);
+    }
+    break :blk buf;
+};
+
 pub const cases = [_]Case{
     .{
         .name = "hk2: keys and probes",
@@ -31,6 +41,12 @@ pub const cases = [_]Case{
         .stdin = "[0,0]\n",
         .stderr = "ZeroVector",
         .exit = 1,
+    },
+    .{
+        .name = "hk2: 0x seed and clamped max-line",
+        .args = &.{ "hk2", "--tables", "2", "--bits", "4", "--seed", "0x1", "--max-line", "0" },
+        .stdin = "[1,2,3]\n",
+        .stdout = "{\"marker\":\"hk2:2:4:0000000000000001:1.5\",\"keys\":[\"1\",\"5\"]}\n",
     },
     .{
         .name = "key: default space",
@@ -176,6 +192,9 @@ pub const cases = [_]Case{
     .{ .name = "s2-polygon: too few vertices", .args = &.{"s2-polygon"}, .stdin = "1 2\n3 4\n", .stderr = "RegionOutOfRange", .exit = 1 },
     .{ .name = "s2-polyline: empty", .args = &.{"s2-polyline"}, .stdin = "", .stderr = "no points on stdin", .exit = 1 },
     .{ .name = "s2-cover: bad radius", .args = &.{ "s2-cover", "0", "0", "-1" }, .stderr = "RadiusOutOfRange", .exit = 1 },
+    .{ .name = "s2-cover: max-cells too large", .args = &.{ "s2-cover", "0", "0", "1000", "--max-cells", "2000" }, .stderr = "--max-cells must be between 1 and 1024", .exit = 1 },
+    .{ .name = "s2-cover: max-cells zero", .args = &.{ "s2-cover", "0", "0", "1000", "--max-cells", "0" }, .stderr = "--max-cells must be between 1 and 1024", .exit = 1 },
+    .{ .name = "s2-polyline: too many points", .args = &.{"s2-polyline"}, .stdin = &too_many_points, .stderr = "too many points (limit is 4096)", .exit = 1 },
 
     .{ .name = "no arguments", .args = &.{}, .stderr = "usage:", .exit = 2 },
     .{ .name = "unknown command", .args = &.{"frobnicate"}, .stderr = "usage:", .exit = 2 },

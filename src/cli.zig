@@ -80,6 +80,8 @@ fn parseCoverOptions(args: []const [:0]const u8) hilbert.s2.CoverOptions {
             o.max_level = parseInt(u8, v, "max-level");
         } else if (eql(name, "--max-cells")) {
             o.max_cells = parseInt(u16, v, "max-cells");
+            if (o.max_cells == 0 or o.max_cells > max_cover_cells)
+                fail("--max-cells must be between 1 and {d}", .{max_cover_cells});
         } else fail("unknown option: {s}", .{name});
     }
     return o;
@@ -110,6 +112,8 @@ fn readLatLngs(init: std.process.Init) ![]hilbert.s2.LatLng {
         const lat_s = it.next() orelse fail("line {d}: expected LAT LNG", .{line_no});
         const lng_s = it.next() orelse fail("line {d}: expected LAT LNG", .{line_no});
         if (it.next() != null) fail("line {d}: expected LAT LNG", .{line_no});
+        if (list.items.len >= hilbert.s2.max_region_verts + 1)
+            fail("too many points (limit is {d})", .{hilbert.s2.max_region_verts});
         try list.append(gpa, .{ .lat = parseFloat(lat_s, "lat"), .lng = parseFloat(lng_s, "lng") });
     }
     if (list.items.len == 0) fail("no points on stdin", .{});
@@ -350,12 +354,13 @@ fn hk2Command(init: std.process.Init, args: []const [:0]const u8, out: *std.Io.W
         } else if (eql(name, "--bits")) {
             bits = parseInt(u8, v, "bits");
         } else if (eql(name, "--seed")) {
-            seed = std.fmt.parseInt(u64, v, 16) catch fail("invalid seed: {s}", .{v});
+            const hex = if (std.ascii.startsWithIgnoreCase(v, "0x")) v[2..] else v;
+            seed = std.fmt.parseInt(u64, hex, 16) catch fail("invalid seed: {s}", .{v});
         } else if (eql(name, "--probes")) {
             n_probes = parseInt(usize, v, "probes");
             if (n_probes == 0 or n_probes > 256) fail("--probes must be between 1 and 256", .{});
         } else if (eql(name, "--max-line")) {
-            max_line = parseInt(usize, v, "max-line");
+            max_line = @max(parseInt(usize, v, "max-line"), 16);
         } else fail("unknown option {s}", .{name});
     }
     const space = hilbert.hk2.Space.init(tables, bits, seed) catch |e| fail("{s}", .{@errorName(e)});

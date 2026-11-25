@@ -74,8 +74,8 @@ pub const Marker = struct {
     key: u128,
 
     pub const prefix = "hk1:";
-    /// Longest possible text form: `hk1:32:32:<16 hex>:<32 hex>`.
-    pub const max_len = prefix.len + 2 + 1 + 2 + 1 + 16 + 1 + 32;
+    /// Longest possible text form: `hk1:<u8>:<u8>:<16 hex>:<32 hex>`.
+    pub const max_len = prefix.len + 3 + 1 + 3 + 1 + 16 + 1 + 32;
 
     pub fn keyBits(self: Marker) u16 {
         return @as(u16, self.dims) * self.bits;
@@ -102,7 +102,7 @@ pub const Marker = struct {
         len += 16;
         buf[len] = ':';
         len += 1;
-        const width = hexWidth(self.keyBits());
+        const width = hexWidth(@min(self.keyBits(), 128));
         writeHex(buf[len..][0..width], self.key);
         return buf[0 .. len + width];
     }
@@ -145,14 +145,21 @@ pub const Marker = struct {
     /// from different spaces and are not comparable.
     pub fn sharedPrefixBits(a: Marker, b: Marker) ?u16 {
         if (a.dims != b.dims or a.bits != b.bits or a.seed != b.seed) return null;
-        const total = a.keyBits();
-        const diff = a.key ^ b.key;
+        const total = @min(a.keyBits(), 128);
+        const mask: u128 = if (total >= 128) ~@as(u128, 0) else (@as(u128, 1) << @intCast(total)) - 1;
+        const diff = (a.key ^ b.key) & mask;
         if (diff == 0) return total;
-        return total - (128 - @as(u16, @clz(diff)));
+        return total -| (128 - @as(u16, @clz(diff)));
     }
 };
 
 fn writeDecimal(buf: []u8, v: u8) usize {
+    if (v >= 100) {
+        buf[0] = '0' + v / 100;
+        buf[1] = '0' + (v / 10) % 10;
+        buf[2] = '0' + v % 10;
+        return 3;
+    }
     if (v >= 10) {
         buf[0] = '0' + v / 10;
         buf[1] = '0' + v % 10;
@@ -282,13 +289,14 @@ pub const Space = struct {
         }
         const shift: u5 = @intCast(self.bits - lvl);
         const side: u32 = @intCast((@as(u64, 1) << @intCast(lvl)) - 1);
+        const side_f: f64 = @floatFromInt(side);
         const unit: f64 = @floatFromInt(@as(u64, 1) << shift);
         var coarse: [curvend.max_dims]u32 = undefined;
         var near: [curvend.max_dims]struct { axis: u8, dist: f64, step: i2 } = undefined;
         var candidates: usize = 0;
         for (pos, 0..) |p, j| {
             const scaled = p / unit;
-            const c: u32 = @min(@as(u32, @intFromFloat(@floor(scaled))), side);
+            const c: u32 = if (scaled >= side_f) side else if (scaled <= 0) 0 else @intFromFloat(@floor(scaled));
             coarse[j] = c;
             const frac = scaled - @as(f64, @floatFromInt(c));
             const step: i2 = if (frac < 0.5) -1 else 1;
@@ -373,7 +381,8 @@ pub const Space = struct {
     /// in `failed_row` if given, and leaves `out` partly written.
     pub fn keys(self: *const Space, embeddings: []const f32, out: []u128, exec: anytype, failed_row: ?*usize) (Error || parallel.ExecError(@TypeOf(exec)))!void {
         const n = self.input_dims;
-        if (embeddings.len != out.len * n) return error.DimensionMismatch;
+        const expected = std.math.mul(usize, out.len, n) catch return error.DimensionMismatch;
+        if (embeddings.len != expected) return error.DimensionMismatch;
         const Ctx = struct {
             space: *const Space,
             rows: []const f32,
@@ -752,4 +761,41 @@ test "batch keys match single keys and report the first bad row" {
     try std.testing.expectError(error.ZeroVector, space.keys(data, out, 4, &failed));
     try std.testing.expectEqual(@as(usize, 5), failed);
     try std.testing.expectError(error.DimensionMismatch, space.keys(data[1..], out, 4, null));
+}
+
+test "probes handles bits == 32 saturation without float-to-int overflow" {
+    const n = 512;
+    var space = try Space.init(std.testing.allocator, .{ .input_dims = n, .dims = 4, .bits = 32 });
+    defer space.deinit();
+    // Align e with axis 0's sign vector so z = sqrt(512) ~ 22.6 and logistic(z) saturates to 2^32.
+    var e: [n]f32 = undefined;
+    for (&e, 0..) |*v, i| v.* = space.coef[i * space.lanes];
+    var pos: [4]f64 = undefined;
+    try space.position(&e, &pos);
+    try std.testing.expect(pos[0] >= @as(f64, @floatFromInt(std.math.maxInt(u32))));
+    var buf: [8]KeyRange = undefined;
+    const ranges = try space.probes(&e, 32, &buf);
+    const k = try space.key(&e);
+    try std.testing.expect(covered(ranges, k));
+}
+
+test "Marker.sharedPrefixBits and format survive hand-constructed out-of-range markers" {
+    const a: Marker = .{ .dims = 4, .bits = 4, .seed = 1, .key = 0 };
+    const b: Marker = .{ .dims = 4, .bits = 4, .seed = 1, .key = @as(u128, 1) << 20 };
+    try std.testing.expectEqual(@as(?u16, 16), a.sharedPrefixBits(b));
+
+    const zero: Marker = .{ .dims = 0, .bits = 0, .seed = 1, .key = 0 };
+    try std.testing.expectEqual(@as(?u16, 0), zero.sharedPrefixBits(zero));
+
+    const huge: Marker = .{ .dims = 255, .bits = 255, .seed = 0x1234, .key = 0xabcd };
+    var buf: [Marker.max_len]u8 = undefined;
+    try std.testing.expectEqualStrings("hk1:255:255:0000000000001234:0000000000000000000000000000abcd", huge.format(&buf));
+    try std.testing.expectEqual(@as(?u16, 128), huge.sharedPrefixBits(huge));
+}
+
+test "Space.keys guards multiplication overflow" {
+    var space = try Space.init(std.testing.allocator, .{ .input_dims = 8 });
+    defer space.deinit();
+    const fake_out: [*]u128 = @ptrFromInt(@alignOf(u128));
+    try std.testing.expectError(error.DimensionMismatch, space.keys(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, fake_out[0..std.math.maxInt(usize)], 1, null));
 }

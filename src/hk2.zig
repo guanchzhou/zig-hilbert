@@ -48,6 +48,8 @@ pub const Space = struct {
     /// One key per table into `out` (length `tables`). If `margins` is given
     /// (length `tables * bits`), it receives every projection, for `probes`.
     pub fn keys(s: Space, e: []const f32, out: []u64, margins: ?[]f64) Error!void {
+        if (s.tables == 0 or s.tables > max_tables) return error.TablesOutOfRange;
+        if (s.bits == 0 or s.bits > max_bits) return error.BitsOutOfRange;
         if (out.len != s.tables) return error.OutputLengthMismatch;
         if (margins) |m| if (m.len != @as(usize, s.tables) * s.bits) return error.OutputLengthMismatch;
         var nonzero = false;
@@ -87,6 +89,59 @@ pub const Space = struct {
         }
     }
 
+    /// Computes keys for 4 valid rows at once, reusing each `splitmix64` sign word
+    /// and SIMD mask across all 4 rows. Returns false if any row is non-finite or zero.
+    fn keys4(s: Space, rows_4: [4][]const f32, out_4: [4][]u64) bool {
+        inline for (0..4) |lane| {
+            var nonzero = false;
+            for (rows_4[lane]) |x| {
+                if (!std.math.isFinite(x)) return false;
+                nonzero = nonzero or x != 0;
+            }
+            if (!nonzero) return false;
+        }
+        const V8 = @Vector(8, f64);
+        const U8 = @Vector(8, u64);
+        const shifts: @Vector(8, u6) = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        const ones: U8 = @splat(1);
+        const zeros_u: U8 = @splat(0);
+        const blocks = (@as(usize, s.bits) + 7) / 8;
+        const width = rows_4[0].len;
+        var acc_vec: [4][max_bits / 8]V8 = undefined;
+        for (0..s.tables) |t| {
+            const seed_t = marker.splitmix64(s.seed, t);
+            inline for (0..4) |lane| {
+                for (acc_vec[lane][0..blocks]) |*av| av.* = @splat(0);
+            }
+            for (0..width) |i| {
+                const w = marker.splitmix64(seed_t, i);
+                var pos_v: [4]V8 = undefined;
+                var neg_v: [4]V8 = undefined;
+                inline for (0..4) |lane| {
+                    const v: f64 = rows_4[lane][i];
+                    pos_v[lane] = @splat(v);
+                    neg_v[lane] = @splat(-v);
+                }
+                for (0..blocks) |blk| {
+                    const chunk: U8 = @splat(w >> @intCast(blk * 8));
+                    const is_neg = ((chunk >> shifts) & ones) != zeros_u;
+                    inline for (0..4) |lane| {
+                        acc_vec[lane][blk] += @select(f64, is_neg, neg_v[lane], pos_v[lane]);
+                    }
+                }
+            }
+            inline for (0..4) |lane| {
+                const acc: *const [max_bits]f64 = @ptrCast(&acc_vec[lane]);
+                var key: u64 = 0;
+                for (0..s.bits) |j| {
+                    if (acc[j] > 0) key |= @as(u64, 1) << @intCast(j);
+                }
+                out_4[lane][t] = key;
+            }
+        }
+        return true;
+    }
+
     /// Multi-threaded batch encoding of `embeddings` (row-major, `input_dims`
     /// floats per row) into `out` (`rows * tables` u64 keys). `exec` is a
     /// thread count (0 = one per core) or a `std.Io`.
@@ -98,10 +153,13 @@ pub const Space = struct {
         exec: anytype,
         failed_row: ?*usize,
     ) (Error || parallel.ExecError(@TypeOf(exec)))!void {
+        if (s.tables == 0 or s.tables > max_tables) return error.TablesOutOfRange;
+        if (s.bits == 0 or s.bits > max_bits) return error.BitsOutOfRange;
         if (input_dims == 0) return error.DimensionMismatch;
         if (out.len % s.tables != 0) return error.OutputLengthMismatch;
         const rows = out.len / s.tables;
-        if (embeddings.len != rows * input_dims) return error.DimensionMismatch;
+        const expected = std.math.mul(usize, rows, input_dims) catch return error.DimensionMismatch;
+        if (embeddings.len != expected) return error.DimensionMismatch;
 
         const Ctx = struct {
             space: Space,
@@ -115,7 +173,33 @@ pub const Space = struct {
             fn run(ctx: *@This(), start: usize, end: usize) void {
                 const width = ctx.input_dims;
                 const tables: usize = ctx.space.tables;
-                for (start..end) |r| {
+                var r = start;
+                while (r + 4 <= end) : (r += 4) {
+                    const ok = ctx.space.keys4(
+                        .{
+                            ctx.rows[(r + 0) * width ..][0..width],
+                            ctx.rows[(r + 1) * width ..][0..width],
+                            ctx.rows[(r + 2) * width ..][0..width],
+                            ctx.rows[(r + 3) * width ..][0..width],
+                        },
+                        .{
+                            ctx.out[(r + 0) * tables ..][0..tables],
+                            ctx.out[(r + 1) * tables ..][0..tables],
+                            ctx.out[(r + 2) * tables ..][0..tables],
+                            ctx.out[(r + 3) * tables ..][0..tables],
+                        },
+                    );
+                    if (!ok) {
+                        for (0..4) |k| {
+                            ctx.space.keys(
+                                ctx.rows[(r + k) * width ..][0..width],
+                                ctx.out[(r + k) * tables ..][0..tables],
+                                null,
+                            ) catch |err| return ctx.record(r + k, err);
+                        }
+                    }
+                }
+                while (r < end) : (r += 1) {
                     ctx.space.keys(
                         ctx.rows[r * width ..][0..width],
                         ctx.out[r * tables ..][0..tables],
@@ -148,7 +232,10 @@ pub const Space = struct {
     }
 
     /// Writes the marker for `keys` into `buf` and returns it.
-    pub fn format(s: Space, key_list: []const u64, buf: []u8) error{NoSpaceLeft}![]u8 {
+    pub fn format(s: Space, key_list: []const u64, buf: []u8) error{ NoSpaceLeft, TablesOutOfRange, BitsOutOfRange, OutputLengthMismatch }![]u8 {
+        if (s.tables == 0 or s.tables > max_tables) return error.TablesOutOfRange;
+        if (s.bits == 0 or s.bits > max_bits) return error.BitsOutOfRange;
+        if (key_list.len != s.tables) return error.OutputLengthMismatch;
         var w: std.Io.Writer = .fixed(buf);
         const digits = (s.bits + 3) / 4;
         w.print("hk2:{d}:{d}:{x:0>16}:", .{ s.tables, s.bits, s.seed }) catch return error.NoSpaceLeft;
@@ -195,6 +282,48 @@ pub fn parse(text: []const u8, out: []u64) ParseError!Space {
     return s;
 }
 
+const ProbeNode = struct {
+    cand: u64,
+    score: f64,
+};
+
+fn probeNodeBefore(a: ProbeNode, b: ProbeNode) bool {
+    return a.score < b.score or (a.score == b.score and a.cand < b.cand);
+}
+
+fn heapPushProbe(heap: []ProbeNode, n: *usize, node: ProbeNode) void {
+    var i = n.*;
+    heap[i] = node;
+    n.* = i + 1;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (!probeNodeBefore(heap[i], heap[parent])) break;
+        std.mem.swap(ProbeNode, &heap[parent], &heap[i]);
+        i = parent;
+    }
+}
+
+fn heapPopProbe(heap: []ProbeNode, n: *usize) ProbeNode {
+    const top = heap[0];
+    n.* -= 1;
+    const len = n.*;
+    if (len > 0) {
+        heap[0] = heap[len];
+        var i: usize = 0;
+        while (true) {
+            var smallest = i;
+            const left = 2 * i + 1;
+            const right = 2 * i + 2;
+            if (left < len and probeNodeBefore(heap[left], heap[smallest])) smallest = left;
+            if (right < len and probeNodeBefore(heap[right], heap[smallest])) smallest = right;
+            if (smallest == i) break;
+            std.mem.swap(ProbeNode, &heap[i], &heap[smallest]);
+            i = smallest;
+        }
+    }
+    return top;
+}
+
 /// Query-directed probes of one table (Lv et al. 2007): `out[0]` is `key`,
 /// then keys with bits flipped, in increasing order of the summed |margin|
 /// of the flipped bits. Returns how many were written (at most `out.len`,
@@ -220,22 +349,14 @@ pub fn probes(margins: []const f64, key: u64, out: []u64) usize {
 
     // Candidate perturbation sets over sorted positions, as bit masks; a set's
     // largest position drives the shift and expand steps.
-    var cand: [2 * 256]u64 = undefined;
-    var score: [2 * 256]f64 = undefined;
-    var n_cand: usize = 1;
-    cand[0] = 1;
-    score[0] = z[0];
+    var heap: [2 * 256]ProbeNode = undefined;
+    var n_cand: usize = 0;
+    heapPushProbe(&heap, &n_cand, .{ .cand = 1, .score = z[0] });
     var written: usize = 1;
     while (written < out.len and n_cand > 0) {
-        var best: usize = 0;
-        for (1..n_cand) |c| {
-            if (score[c] < score[best] or (score[c] == score[best] and cand[c] < cand[best])) best = c;
-        }
-        const set = cand[best];
-        const s = score[best];
-        n_cand -= 1;
-        cand[best] = cand[n_cand];
-        score[best] = score[n_cand];
+        const best = heapPopProbe(&heap, &n_cand);
+        const set = best.cand;
+        const s = best.score;
 
         var flipped = key;
         var rest = set;
@@ -248,14 +369,21 @@ pub fn probes(margins: []const f64, key: u64, out: []u64) usize {
         written += 1;
 
         const m: usize = 63 - @clz(set);
-        if (m + 1 < bits and n_cand + 2 <= cand.len) {
+        if (m + 1 < bits and n_cand + 2 <= heap.len) {
             const next = @as(u64, 1) << @intCast(m + 1);
-            cand[n_cand] = (set & ~(@as(u64, 1) << @intCast(m))) | next;
-            score[n_cand] = s - z[m] + z[m + 1];
-            n_cand += 1;
-            cand[n_cand] = set | next;
-            score[n_cand] = s + z[m + 1];
-            n_cand += 1;
+            const shifted = (set & ~(@as(u64, 1) << @intCast(m))) | next;
+            const shift_score = if (std.math.isFinite(s) and std.math.isFinite(z[m]))
+                s - z[m] + z[m + 1]
+            else if (!std.math.isFinite(z[m + 1]))
+                std.math.inf(f64)
+            else blk: {
+                var sum: f64 = z[m + 1];
+                var rem = set & ~(@as(u64, 1) << @intCast(m));
+                while (rem != 0) : (rem &= rem - 1) sum += z[@ctz(rem)];
+                break :blk sum;
+            };
+            heapPushProbe(&heap, &n_cand, .{ .cand = shifted, .score = shift_score });
+            heapPushProbe(&heap, &n_cand, .{ .cand = set | next, .score = s + z[m + 1] });
         }
     }
     return written;
@@ -429,4 +557,86 @@ test "probes clamp to 64 margins and survive empty and NaN margins" {
     try std.testing.expectEqual(@as(u64, 0b1000), out[1]);
     try std.testing.expectEqual(@as(u64, 0b0010), out[2]);
     for (out, 0..) |a, i| for (out[0..i]) |b| try std.testing.expect(a != b);
+}
+
+test "probes handles multiple NaN margins without inf-inf NaN corruption" {
+    const nan = std.math.nan(f64);
+    const m = [_]f64{ nan, nan, nan, 0.1, 0.2 };
+    var out: [32]u64 = undefined;
+    const got = probes(&m, 0, &out);
+    try std.testing.expectEqual(@as(usize, 32), got);
+    // Own key, then finite single/pair flips before any NaN bit flips.
+    try std.testing.expectEqual(@as(u64, 0b00000), out[0]);
+    try std.testing.expectEqual(@as(u64, 0b01000), out[1]);
+    try std.testing.expectEqual(@as(u64, 0b10000), out[2]);
+    try std.testing.expectEqual(@as(u64, 0b11000), out[3]);
+    for (out[0..got], 0..) |a, i| for (out[0..i]) |b| try std.testing.expect(a != b);
+
+    // Min-heap order check: scores must be monotonically non-decreasing.
+    const m12 = [_]f64{ 0.7, 0.05, 0.3, 0.9, 0.12, 0.4, 0.02, 0.8, 0.25, 0.6, 0.15, 0.5 };
+    var p64: [64]u64 = undefined;
+    const n64 = probes(&m12, 0, &p64);
+    try std.testing.expectEqual(@as(usize, 64), n64);
+    var prev_score: f64 = 0;
+    for (p64[0..n64]) |mask| {
+        var score: f64 = 0;
+        for (m12, 0..) |v, bit| if ((mask >> @intCast(bit)) & 1 == 1) {
+            score += v;
+        };
+        try std.testing.expect(score + 1e-12 >= prev_score);
+        prev_score = score;
+    }
+}
+
+test "hk2 Space validates tables and bits on hand-constructed structs and keysBatch overflow" {
+    const e = [_]f32{ 1, 2, 3, 4 };
+    var out: [2]u64 = undefined;
+    var buf: [64]u8 = undefined;
+
+    const bad_spaces = [_]struct { s: Space, err: anyerror }{
+        .{ .s = .{ .tables = 0, .bits = 8 }, .err = error.TablesOutOfRange },
+        .{ .s = .{ .tables = max_tables + 1, .bits = 8 }, .err = error.TablesOutOfRange },
+        .{ .s = .{ .tables = 1, .bits = 0 }, .err = error.BitsOutOfRange },
+        .{ .s = .{ .tables = 1, .bits = max_bits + 1 }, .err = error.BitsOutOfRange },
+    };
+    for (bad_spaces) |c| {
+        try std.testing.expectError(c.err, c.s.keys(&e, out[0..1], null));
+        try std.testing.expectError(c.err, c.s.keysBatch(&e, 4, out[0..1], 1, null));
+        try std.testing.expectError(c.err, c.s.format(out[0..1], &buf));
+    }
+
+    // Overflow in rows * input_dims must fail cleanly with DimensionMismatch.
+    const valid = try Space.init(1, 8, 1);
+    const fake_out: [*]u64 = @ptrFromInt(@alignOf(u64));
+    try std.testing.expectError(error.DimensionMismatch, valid.keysBatch(&e, 4, fake_out[0..std.math.maxInt(usize)], 1, null));
+}
+
+test "keysBatch 4-row batching matches keys and reports exact failing row in any lane" {
+    const d = 12;
+    const s = try Space.init(3, 16, 42);
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 7, 8, 9 }) |rows| {
+        const data = try std.testing.allocator.alloc(f32, rows * d);
+        defer std.testing.allocator.free(data);
+        for (data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i + 1)) * 0.7);
+        const batch_out = try std.testing.allocator.alloc(u64, rows * s.tables);
+        defer std.testing.allocator.free(batch_out);
+        try s.keysBatch(data, d, batch_out, 1, null);
+        var single: [3]u64 = undefined;
+        for (0..rows) |r| {
+            try s.keys(data[r * d ..][0..d], &single, null);
+            try std.testing.expectEqualSlices(u64, &single, batch_out[r * s.tables ..][0..s.tables]);
+        }
+    }
+
+    // Failing row in each of the 4 lanes of a batch must report exact row index.
+    var data: [8 * d]f32 = undefined;
+    var batch_out: [8 * 3]u64 = undefined;
+    for (0..4) |bad_lane| {
+        for (&data, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i + 1)) * 0.3);
+        const bad_row = 4 + bad_lane;
+        @memset(data[bad_row * d ..][0..d], 0);
+        var failed: usize = undefined;
+        try std.testing.expectError(error.ZeroVector, s.keysBatch(&data, d, &batch_out, 1, &failed));
+        try std.testing.expectEqual(bad_row, failed);
+    }
 }

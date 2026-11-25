@@ -41,7 +41,7 @@ pub fn forEachRange(n: usize, requested: usize, min_per_thread: usize, ctx: anyt
             while (true) {
                 const start = s.next.fetchAdd(s.block, .monotonic);
                 if (start >= s.n) return;
-                work(s.ctx, start, @min(start + s.block, s.n));
+                work(s.ctx, start, start + @min(s.n - start, s.block));
             }
         }
     };

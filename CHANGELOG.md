@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3 - 2026-11-25
+
+- Fix the 1-unit shift in `s2.cellRect` on flipped cells, antipodal and degenerate false positives in `s2.arcsCross`, and antipodal mirror false positives in `s2.polygonContains`.
+- Validate `lat`/`lng` in `s2.covering` for large radii, reject unsorted input in `s2.mergeRanges`, and fix signed overflows in `Cell.child` and `Cell.center`.
+- Fix the `marker.Space.probes` `@intFromFloat` saturation crash at `bits == 32`, add `Marker` out-of-range guards, harden `hk2.Space` bounds and `inf - inf` score handling, fix `parallel.forEachRange` overflow, and enforce CLI limits.
+- Precompute `cellRect` and `rectVertices` once per candidate cell in `s2`, use binary min-heaps in `s2.cover` and `hk2.probes`, and batch 4 rows per `splitmix64` hash in `hk2.Space.keysBatch`.
+
 ## 0.3.2 - 2026-10-25
 
 - `s2.Cell.fromFacePosLevel` returns `error.InvalidCell` for a face above 5 or a position wider than 61 bits instead of overflowing.

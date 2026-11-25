@@ -23,6 +23,7 @@ pub const Error = error{
     CoverOptionsOutOfRange,
     RegionOutOfRange,
     CoverTooLarge,
+    UnsortedCells,
 };
 
 pub const LatLng = struct { lat: f64, lng: f64 };
@@ -64,9 +65,9 @@ pub const Cell = struct {
 
     /// The child at `position` (0..3). `self` must not be a leaf.
     pub fn child(self: Cell, position: u2) Cell {
-        const new_lsb: i64 = @intCast(lsb(self.id) >> 2);
-        const delta = (@as(i64, 2) * position + 1 - 4) * new_lsb;
-        return .{ .id = @bitCast(@as(i64, @bitCast(self.id)) + delta) };
+        const new_lsb = lsb(self.id) >> 2;
+        const delta = (@as(u64, 2) * position +% 1 -% 4) *% new_lsb;
+        return .{ .id = self.id +% delta };
     }
 
     pub fn children(self: Cell) [4]Cell {
@@ -123,10 +124,12 @@ pub const Cell = struct {
         var i: i32 = undefined;
         var j: i32 = undefined;
         const f = toFaceIJ(self, &i, &j);
-        const low: i32 = @intCast((self.id >> 2) & 1);
-        const delta: i32 = if (self.leaf()) 1 else if (((i ^ low) & 1) == 1) 2 else 0;
-        const u = stToUv(siTiToSt(@intCast(2 * i + delta)));
-        const v = stToUv(siTiToSt(@intCast(2 * j + delta)));
+        const iu: u32 = @intCast(i);
+        const ju: u32 = @intCast(j);
+        const low: u32 = @intCast((self.id >> 2) & 1);
+        const delta: u32 = if (self.leaf()) 1 else if (((iu ^ low) & 1) == 1) 2 else 0;
+        const u = stToUv(siTiToSt(2 * iu + delta));
+        const v = stToUv(siTiToSt(2 * ju + delta));
         const p = faceUvToXyz(f, u, v);
         return .{
             .lat = std.math.atan2(p.z, @sqrt(p.x * p.x + p.y * p.y)) * (180.0 / std.math.pi),
@@ -201,6 +204,8 @@ pub fn fromToken(text: []const u8) Error!Cell {
 /// circumference or more covers the whole sphere and returns one range.
 /// `out` needs room for up to 9 ranges.
 pub fn covering(lat: f64, lng: f64, radius_m: f64, out: []Range) Error![]Range {
+    if (!std.math.isFinite(lat) or !std.math.isFinite(lng)) return error.NonFinite;
+    if (lat < -90 or lat > 90) return error.LatitudeOutOfRange;
     if (!std.math.isFinite(radius_m) or radius_m < 0) return error.RadiusOutOfRange;
     const quarter = (std.math.pi / 2.0) * earth_radius_m;
     if (radius_m >= quarter) {
@@ -256,6 +261,45 @@ pub const Region = struct {
 
 const max_cover_scratch = 2048;
 
+fn coverCellBefore(a: Cell, b: Cell) bool {
+    const la = a.level();
+    const lb = b.level();
+    return la < lb or (la == lb and a.id < b.id);
+}
+
+fn heapPushCell(heap: []Cell, n: *usize, cell: Cell) void {
+    var i = n.*;
+    heap[i] = cell;
+    n.* = i + 1;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (!coverCellBefore(heap[i], heap[parent])) break;
+        std.mem.swap(Cell, &heap[parent], &heap[i]);
+        i = parent;
+    }
+}
+
+fn heapPopCell(heap: []Cell, n: *usize) Cell {
+    const top = heap[0];
+    n.* -= 1;
+    const len = n.*;
+    if (len > 0) {
+        heap[0] = heap[len];
+        var i: usize = 0;
+        while (true) {
+            var smallest = i;
+            const left = 2 * i + 1;
+            const right = 2 * i + 2;
+            if (left < len and coverCellBefore(heap[left], heap[smallest])) smallest = left;
+            if (right < len and coverCellBefore(heap[right], heap[smallest])) smallest = right;
+            if (smallest == i) break;
+            std.mem.swap(Cell, &heap[i], &heap[smallest]);
+            i = smallest;
+        }
+    }
+    return top;
+}
+
 /// Cells covering `region`, sorted by id. `out` must hold at least
 /// `max(opts.max_cells, 6)` cells, and more with `min_level`, which can
 /// exceed `max_cells`. Each edge of a polyline or polygon is the shorter arc
@@ -271,28 +315,19 @@ pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
     for (0..6) |face_| {
         const cell = Cell.fromFace(@intCast(face_));
         if (region.mayIntersect(region.ctx, cell)) {
-            scratch[n] = cell;
-            n += 1;
+            heapPushCell(&scratch, &n, cell);
         }
     }
 
     var result_n: usize = 0;
     while (n > 0) {
-        var best: usize = 0;
-        for (scratch[1..n], 1..) |cell, i| {
-            const cur = scratch[best];
-            if (cell.level() < cur.level() or (cell.level() == cur.level() and cell.id < cur.id)) best = i;
-        }
-        const cell = scratch[best];
-        n -= 1;
-        scratch[best] = scratch[n];
+        const cell = heapPopCell(&scratch, &n);
 
         if (cell.level() < opts.min_level) {
             for (cell.children()) |child_| {
                 if (!region.mayIntersect(region.ctx, child_)) continue;
                 if (n >= scratch.len) return error.CoverTooLarge;
-                scratch[n] = child_;
-                n += 1;
+                heapPushCell(&scratch, &n, child_);
             }
             continue;
         }
@@ -320,8 +355,7 @@ pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
             result_n += 1;
         } else {
             for (hit[0..hn]) |child_| {
-                scratch[n] = child_;
-                n += 1;
+                heapPushCell(&scratch, &n, child_);
             }
         }
     }
@@ -335,19 +369,23 @@ pub fn cover(region: Region, opts: CoverOptions, out: []Cell) Error![]Cell {
 }
 
 /// Merge `cells` (sorted by id) into inclusive id ranges. Every cell must be
-/// valid.
+/// valid and `cells` must be sorted in non-decreasing id order.
 pub fn mergeRanges(cells: []const Cell, out: []Range) Error![]Range {
     var n: usize = 0;
-    for (cells) |cell| {
+    var prev_id: u64 = 0;
+    for (cells, 0..) |cell, idx| {
         if (!cell.valid()) return error.InvalidCell;
-        const r = cell.range();
-        if (n > 0 and r.lo <= out[n - 1].hi +% 1) {
-            out[n - 1].hi = @max(out[n - 1].hi, r.hi);
-        } else {
-            if (n >= out.len) return error.BufferTooSmall;
-            out[n] = r;
-            n += 1;
+        if (idx > 0 and cell.id < prev_id) return error.UnsortedCells;
+        prev_id = cell.id;
+        var r = cell.range();
+        while (n > 0 and r.lo <= out[n - 1].hi + 1 and out[n - 1].lo <= r.hi + 1) {
+            r.lo = @min(r.lo, out[n - 1].lo);
+            r.hi = @max(r.hi, out[n - 1].hi);
+            n -= 1;
         }
+        if (n >= out.len) return error.BufferTooSmall;
+        out[n] = r;
+        n += 1;
     }
     return out[0..n];
 }
@@ -533,7 +571,7 @@ fn cellAt(face_: u3, i: i32, j: i32, level_: u8) Cell {
     return leaf_.parent(level_);
 }
 
-const max_region_verts = 4096;
+pub const max_region_verts = 4096;
 
 const Cap = struct {
     center: Xyz,
@@ -583,6 +621,9 @@ const Polyline = struct {
 
 const Polygon = struct {
     pts: []const Xyz,
+    origin: Xyz,
+    origin_inside: bool,
+    degenerate: bool,
 
     fn region(self: *const Polygon) Region {
         return .{
@@ -594,15 +635,36 @@ const Polygon = struct {
 
     fn mayIntersect(ctx: *const anyopaque, cell: Cell) bool {
         const self: *const Polygon = @ptrCast(@alignCast(ctx));
-        if (chainHits(self.pts, cell, true)) return true;
-        if (self.pts.len < 2) return false;
-        return polygonContains(self.pts, cellCap(cell).center);
+        const r = cellRect(cell);
+        for (self.pts) |p| if (rectContainsPoint(r, p)) return true;
+        const v = rectVertices(r);
+        if (chainSegmentsHitVerts(self.pts, v, true)) return true;
+        if (self.pts.len < 3 or self.degenerate) return false;
+        return self.containsPoint(vertsCenter(v));
     }
 
     fn containsCell(ctx: *const anyopaque, cell: Cell) bool {
         const self: *const Polygon = @ptrCast(@alignCast(ctx));
-        if (chainHits(self.pts, cell, true)) return false;
-        return polygonContains(self.pts, cellCap(cell).center);
+        if (self.pts.len < 3 or self.degenerate) return false;
+        const r = cellRect(cell);
+        for (self.pts) |p| if (rectContainsPoint(r, p)) return false;
+        const v = rectVertices(r);
+        if (chainSegmentsHitVerts(self.pts, v, true)) return false;
+        return self.containsPoint(vertsCenter(v));
+    }
+
+    fn containsPoint(self: *const Polygon, p: Xyz) bool {
+        if (self.degenerate) return false;
+        var inside = self.origin_inside;
+        if (dot(self.origin, p) < -0.5) {
+            const ref: Xyz = if (@abs(self.origin.x) < 0.9) .{ .x = 1, .y = 0, .z = 0 } else .{ .x = 0, .y = 1, .z = 0 };
+            const mid = normalize(cross(self.origin, ref));
+            if (toggleCrossings(self.pts, self.origin, mid, null)) inside = !inside;
+            if (toggleCrossings(self.pts, mid, p, null)) inside = !inside;
+        } else {
+            if (toggleCrossings(self.pts, self.origin, p, null)) inside = !inside;
+        }
+        return inside;
     }
 };
 
@@ -610,6 +672,60 @@ fn xyzVerts(points: []const LatLng, buf: []Xyz) Error!Polyline {
     if (points.len > buf.len) return error.BufferTooSmall;
     for (points, 0..) |p, i| buf[i] = try latLngToXyz(p.lat, p.lng);
     return .{ .pts = buf[0..points.len] };
+}
+
+fn polygonSignedTurn(pts: []const Xyz) f64 {
+    var sum: f64 = 0;
+    const n = pts.len;
+    for (0..n) |i| {
+        const prev = pts[(i + n - 1) % n];
+        const cur = pts[i];
+        const next = pts[(i + 1) % n];
+        const e_prev = cross(prev, cur);
+        const e_next = cross(cur, next);
+        const l1 = @sqrt(dot(e_prev, e_prev));
+        const l2 = @sqrt(dot(e_next, e_next));
+        if (l1 == 0 or l2 == 0) continue;
+        const n1 = Xyz{ .x = e_prev.x / l1, .y = e_prev.y / l1, .z = e_prev.z / l1 };
+        const n2 = Xyz{ .x = e_next.x / l2, .y = e_next.y / l2, .z = e_next.z / l2 };
+        sum += std.math.atan2(dot(cur, cross(n1, n2)), dot(n1, n2));
+    }
+    return sum;
+}
+
+fn orderedCCW(a: Xyz, b: Xyz, c: Xyz, o: Xyz) bool {
+    var sum: u8 = 0;
+    if (dot(cross(b, o), a) >= 0) sum += 1;
+    if (dot(cross(c, o), b) >= 0) sum += 1;
+    if (dot(cross(a, o), c) > 0) sum += 1;
+    return sum >= 2;
+}
+
+fn chooseOrigin(pts: []const Xyz, anchor: Xyz) Xyz {
+    const candidates = [_]Xyz{
+        normalize(.{ .x = -0.0099994664350250197, .y = 0.0025924542609324121, .z = 0.99994664350250195 }),
+        normalize(.{ .x = 0.9999123412341234, .y = 0.0112345678901234, .z = -0.0069876543210987 }),
+        normalize(.{ .x = -0.0087654321098765, .y = 0.9999345678901234, .z = 0.0073456789012345 }),
+        normalize(.{ .x = 0.5771234567890123, .y = -0.5774567890123456, .z = 0.5774689012345678 }),
+    };
+    var best = candidates[0];
+    var best_score: f64 = -1;
+    for (candidates) |cand| {
+        if (@abs(dot(cand, anchor)) > 0.85) continue;
+        var min_edge: f64 = 1.0;
+        for (pts, 0..) |a, i| {
+            const b = pts[(i + 1) % pts.len];
+            const e = cross(a, b);
+            const el = @sqrt(dot(e, e));
+            if (el == 0) continue;
+            min_edge = @min(min_edge, @abs(dot(e, cand)) / el);
+        }
+        if (min_edge > best_score) {
+            best_score = min_edge;
+            best = cand;
+        }
+    }
+    return best;
 }
 
 fn polygonVerts(points: []const LatLng, buf: []Xyz) Error!Polygon {
@@ -621,7 +737,28 @@ fn polygonVerts(points: []const LatLng, buf: []Xyz) Error!Polygon {
     if (n < 3) return error.RegionOutOfRange;
     if (n > buf.len) return error.BufferTooSmall;
     for (points[0..n], 0..) |p, i| buf[i] = try latLngToXyz(p.lat, p.lng);
-    return .{ .pts = buf[0..n] };
+    const pts = buf[0..n];
+    // Orient CCW around the smaller interior (area <= 2*pi).
+    if (polygonSignedTurn(pts) < 0) std.mem.reverse(Xyz, pts);
+
+    // Pick a non-degenerate vertex as anchor to determine origin_inside.
+    var anchor_idx: ?usize = null;
+    for (0..n) |i| {
+        const prev = pts[(i + n - 1) % n];
+        const cur = pts[i];
+        const next = pts[(i + 1) % n];
+        if (dot(cross(prev, cur), cross(prev, cur)) > 0 and dot(cross(cur, next), cross(cur, next)) > 0) {
+            anchor_idx = i;
+            break;
+        }
+    }
+    const ai = anchor_idx orelse return .{ .pts = pts, .origin = .{ .x = 0, .y = 0, .z = 1 }, .origin_inside = false, .degenerate = true };
+    const prev_i = (ai + n - 1) % n;
+    const next_i = (ai + 1) % n;
+    const origin = chooseOrigin(pts, pts[ai]);
+    var origin_inside = orderedCCW(pts[next_i], origin, pts[prev_i], pts[ai]);
+    if (toggleCrossings(pts, pts[ai], origin, .{ .prev = prev_i, .cur = ai })) origin_inside = !origin_inside;
+    return .{ .pts = pts, .origin = origin, .origin_inside = origin_inside, .degenerate = false };
 }
 
 fn latLngToXyz(lat: f64, lng: f64) Error!Xyz {
@@ -636,6 +773,10 @@ fn latLngToXyz(lat: f64, lng: f64) Error!Xyz {
 fn normalize(p: Xyz) Xyz {
     const len = @sqrt(dot(p, p));
     return .{ .x = p.x / len, .y = p.y / len, .z = p.z / len };
+}
+
+fn add(a: Xyz, b: Xyz) Xyz {
+    return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
 }
 
 fn dot(a: Xyz, b: Xyz) f64 {
@@ -660,13 +801,16 @@ fn cellRect(cell: Cell) CellRect {
     var i: i32 = undefined;
     var j: i32 = undefined;
     const face_ = toFaceIJ(cell, &i, &j);
-    const half = @divFloor(sizeIJ(cell.level()), 2);
+    const size = sizeIJ(cell.level());
+    const mask = ~(size - 1);
+    const lo_i = i & mask;
+    const lo_j = j & mask;
     return .{
         .face = face_,
-        .i0 = i - half,
-        .j0 = j - half,
-        .i1 = i - half + sizeIJ(cell.level()),
-        .j1 = j - half + sizeIJ(cell.level()),
+        .i0 = lo_i,
+        .j0 = lo_j,
+        .i1 = lo_i + size,
+        .j1 = lo_j + size,
     };
 }
 
@@ -677,8 +821,7 @@ fn ijToXyz(face_: u3, i: i32, j: i32) Xyz {
     return normalize(faceUvToXyz(face_, stToUv(s), stToUv(t)));
 }
 
-fn cellVertices(cell: Cell) [4]Xyz {
-    const r = cellRect(cell);
+fn rectVertices(r: CellRect) [4]Xyz {
     return .{
         ijToXyz(r.face, r.i0, r.j0),
         ijToXyz(r.face, r.i1, r.j0),
@@ -687,15 +830,23 @@ fn cellVertices(cell: Cell) [4]Xyz {
     };
 }
 
-fn cellCap(cell: Cell) Cap {
-    const v = cellVertices(cell);
+fn cellVertices(cell: Cell) [4]Xyz {
+    return rectVertices(cellRect(cell));
+}
+
+fn vertsCenter(v: [4]Xyz) Xyz {
     var sum = Xyz{ .x = 0, .y = 0, .z = 0 };
     for (v) |p| {
         sum.x += p.x;
         sum.y += p.y;
         sum.z += p.z;
     }
-    const center = normalize(sum);
+    return normalize(sum);
+}
+
+fn cellCap(cell: Cell) Cap {
+    const v = cellVertices(cell);
+    const center = vertsCenter(v);
     var ang: f64 = 0;
     for (v) |p| ang = @max(ang, angleBetween(center, p));
     return .{ .center = center, .angle = ang };
@@ -712,62 +863,80 @@ fn pointIJ(p: Xyz) struct { face: u3, i: i32, j: i32 } {
     };
 }
 
-fn cellContainsPoint(cell: Cell, p: Xyz) bool {
+fn rectContainsPoint(r: CellRect, p: Xyz) bool {
     const q = pointIJ(p);
-    const r = cellRect(cell);
     return q.face == r.face and q.i >= r.i0 and q.i < r.i1 and q.j >= r.j0 and q.j < r.j1;
+}
+
+fn pointOnArc(x: Xyz, a: Xyz, b: Xyz, ab: Xyz) bool {
+    return dot(cross(a, x), ab) >= 0 and dot(cross(x, b), ab) >= 0 and dot(x, add(a, b)) > 0;
 }
 
 fn arcsCross(a: Xyz, b: Xyz, c: Xyz, d: Xyz) bool {
     const ab = cross(a, b);
     const cd = cross(c, d);
+    if (dot(ab, ab) == 0 or dot(cd, cd) == 0) return false;
     const s1 = dot(ab, c);
     const s2 = dot(ab, d);
     const s3 = dot(cd, a);
     const s4 = dot(cd, b);
-    // A zero means the arcs touch. Same-side pairs are disjoint.
     if (s1 * s2 > 0 or s3 * s4 > 0) return false;
-    return true;
+    if ((s1 == 0 and s2 == 0) or (s3 == 0 and s4 == 0)) {
+        return pointOnArc(c, a, b, ab) or pointOnArc(d, a, b, ab) or
+            pointOnArc(a, c, d, cd) or pointOnArc(b, c, d, cd);
+    }
+    // For non-collinear arcs, intersection p = ab x cd satisfies
+    // dot(p, a+b) = (s3 - s4)(1 + a.b) and dot(p, c+d) = (s2 - s1)(1 + c.d).
+    // Both shorter arcs meet at the same point iff those have the same sign.
+    return (s3 - s4) * (s2 - s1) > 0;
 }
 
-fn segmentHitsCell(a: Xyz, b: Xyz, cell: Cell) bool {
-    if (cellContainsPoint(cell, a) or cellContainsPoint(cell, b)) return true;
-    const v = cellVertices(cell);
+fn rayCrossesEdge(a: Xyz, b: Xyz, c: Xyz, d: Xyz) bool {
+    const ab = cross(a, b);
+    const cd = cross(c, d);
+    if (dot(ab, ab) == 0 or dot(cd, cd) == 0) return false;
+    const s1 = dot(ab, c);
+    const s2 = dot(ab, d);
+    if ((s1 < 0) == (s2 < 0)) return false;
+    const s3 = dot(cd, a);
+    const s4 = dot(cd, b);
+    if ((s3 < 0) == (s4 < 0)) return false;
+    return (s3 - s4) * (s2 - s1) > 0;
+}
+
+fn toggleCrossings(pts: []const Xyz, a: Xyz, b: Xyz, skip: ?struct { prev: usize, cur: usize }) bool {
+    var odd = false;
+    const n = pts.len;
+    for (0..n) |i| {
+        if (skip) |sk| if (i == sk.prev or i == sk.cur) continue;
+        if (rayCrossesEdge(a, b, pts[i], pts[(i + 1) % n])) odd = !odd;
+    }
+    return odd;
+}
+
+fn segmentHitsVerts(a: Xyz, b: Xyz, v: [4]Xyz) bool {
     for (0..4) |k| {
         if (arcsCross(a, b, v[k], v[(k + 1) % 4])) return true;
     }
     return false;
 }
 
-fn chainHits(pts: []const Xyz, cell: Cell, closed: bool) bool {
-    if (pts.len == 0) return false;
-    for (pts) |p| if (cellContainsPoint(cell, p)) return true;
-    if (pts.len == 1) return false;
+fn chainSegmentsHitVerts(pts: []const Xyz, v: [4]Xyz, closed: bool) bool {
+    if (pts.len < 2) return false;
     for (pts[0 .. pts.len - 1], pts[1..]) |a, b| {
-        if (segmentHitsCell(a, b, cell)) return true;
+        if (segmentHitsVerts(a, b, v)) return true;
     }
-    if (closed and pts.len >= 3 and segmentHitsCell(pts[pts.len - 1], pts[0], cell)) return true;
+    if (closed and pts.len >= 3 and segmentHitsVerts(pts[pts.len - 1], pts[0], v)) return true;
     return false;
 }
 
-fn polygonContains(pts: []const Xyz, p: Xyz) bool {
-    var sum: f64 = 0;
-    for (pts, 0..) |a, i| {
-        const b = pts[(i + 1) % pts.len];
-        const ta = tangent(p, a) orelse return true;
-        const tb = tangent(p, b) orelse return true;
-        const na = normalize(ta);
-        const nb = normalize(tb);
-        sum += std.math.atan2(dot(p, cross(na, nb)), dot(na, nb));
-    }
-    return @abs(sum) > std.math.pi;
-}
-
-fn tangent(origin: Xyz, p: Xyz) ?Xyz {
-    const d = dot(origin, p);
-    const t = Xyz{ .x = p.x - origin.x * d, .y = p.y - origin.y * d, .z = p.z - origin.z * d };
-    if (dot(t, t) < 1e-24) return null;
-    return t;
+fn chainHits(pts: []const Xyz, cell: Cell, closed: bool) bool {
+    if (pts.len == 0) return false;
+    const r = cellRect(cell);
+    for (pts) |p| if (rectContainsPoint(r, p)) return true;
+    if (pts.len == 1) return false;
+    const v = rectVertices(r);
+    return chainSegmentsHitVerts(pts, v, closed);
 }
 
 fn neighborhood(cell: Cell, out: *[9]Cell) usize {
@@ -997,4 +1166,154 @@ test "a min_level beyond the expansion queue is a clear error" {
     var out: [8]Cell = undefined;
     const opts = CoverOptions{ .min_level = 6, .max_level = 6 };
     try std.testing.expectError(error.CoverTooLarge, coverCap(0, 0, earth_radius_m * 4, opts, &out));
+}
+
+test "cellRect aligns to exact power-of-two boundaries on all orientations" {
+    for (0..6) |f| {
+        const root = Cell.fromFace(@intCast(f));
+        const r0 = cellRect(root);
+        try std.testing.expectEqual(@as(i32, 0), r0.i0);
+        try std.testing.expectEqual(@as(i32, 0), r0.j0);
+        try std.testing.expectEqual(max_size, r0.i1);
+        try std.testing.expectEqual(max_size, r0.j1);
+
+        // Descend through all 4 children at several levels to hit both flip == 0 and flip == 1.
+        for (root.children()) |c1| {
+            for (c1.children()) |c2| {
+                const size = sizeIJ(c2.level());
+                const r = cellRect(c2);
+                try std.testing.expectEqual(@as(u3, @intCast(f)), r.face);
+                try std.testing.expect(r.i0 >= 0 and r.j0 >= 0 and r.i1 <= max_size and r.j1 <= max_size);
+                try std.testing.expectEqual(@as(i32, 0), @mod(r.i0, size));
+                try std.testing.expectEqual(@as(i32, 0), @mod(r.j0, size));
+                try std.testing.expectEqual(size, r.i1 - r.i0);
+                try std.testing.expectEqual(size, r.j1 - r.j0);
+                try std.testing.expect(c2.contains(Cell.fromFaceIJ(r.face, @intCast(r.i0), @intCast(r.j0))));
+                try std.testing.expect(c2.contains(Cell.fromFaceIJ(r.face, @intCast(r.i1 - 1), @intCast(r.j1 - 1))));
+            }
+        }
+    }
+}
+
+test "arcsCross rejects antipodal crossings and degenerate arcs" {
+    const a = normalize(.{ .x = 0.1, .y = 0, .z = 1 });
+    const b = normalize(.{ .x = -0.1, .y = 0, .z = 1 });
+    const c_north = normalize(.{ .x = 0, .y = 0.1, .z = 1 });
+    const d_north = normalize(.{ .x = 0, .y = -0.1, .z = 1 });
+    const c_south = normalize(.{ .x = 0, .y = 0.1, .z = -1 });
+    const d_south = normalize(.{ .x = 0, .y = -0.1, .z = -1 });
+
+    // Same hemisphere crossing vs antipodal non-crossing.
+    try std.testing.expect(arcsCross(a, b, c_north, d_north));
+    try std.testing.expect(!arcsCross(a, b, c_south, d_south));
+
+    // Degenerate zero-length and antipodal arcs must return false.
+    try std.testing.expect(!arcsCross(a, a, c_north, d_north));
+    try std.testing.expect(!arcsCross(a, b, c_north, c_north));
+    try std.testing.expect(!arcsCross(a, .{ .x = -a.x, .y = -a.y, .z = -a.z }, c_north, d_north));
+
+    // Shared endpoint vs antipodal endpoint.
+    const eq0 = Xyz{ .x = 1, .y = 0, .z = 0 };
+    const eq90 = Xyz{ .x = 0, .y = 1, .z = 0 };
+    const eq180 = Xyz{ .x = -1, .y = 0, .z = 0 };
+    const np = Xyz{ .x = 0, .y = 0, .z = 1 };
+    try std.testing.expect(arcsCross(eq0, eq90, eq0, np));
+    try std.testing.expect(!arcsCross(eq0, eq90, eq180, np));
+
+    // Collinear overlapping vs collinear antipodal.
+    const eq45 = normalize(.{ .x = 1, .y = 1, .z = 0 });
+    const eq135 = normalize(.{ .x = -1, .y = 1, .z = 0 });
+    const eq270 = Xyz{ .x = 0, .y = -1, .z = 0 };
+    try std.testing.expect(arcsCross(eq0, eq90, eq45, eq135));
+    try std.testing.expect(!arcsCross(eq0, eq90, eq180, eq270));
+}
+
+test "coverPolygon has no antipodal false positives for CCW, CW, polar, and concave rings" {
+    const opts = CoverOptions{ .max_level = 10, .max_cells = 64 };
+    var out: [64]Cell = undefined;
+
+    // Small CCW triangle near (20, 20): antipode (-20, -160) must NOT be covered.
+    const ccw = [_]LatLng{
+        .{ .lat = 20, .lng = 20 },
+        .{ .lat = 20, .lng = 22 },
+        .{ .lat = 22, .lng = 21 },
+    };
+    const ccw_cells = try coverPolygon(&ccw, opts, &out);
+    try std.testing.expect(try cellCovers(ccw_cells, 20.5, 21.0));
+    try std.testing.expect(!try cellCovers(ccw_cells, -20.5, -159.0));
+    try std.testing.expect(!try cellCovers(ccw_cells, -20.0, -160.0));
+
+    // Same triangle reversed (CW): still covers small interior, not antipode or exterior.
+    const cw = [_]LatLng{ ccw[0], ccw[2], ccw[1] };
+    const cw_cells = try coverPolygon(&cw, opts, &out);
+    try std.testing.expect(try cellCovers(cw_cells, 20.5, 21.0));
+    try std.testing.expect(!try cellCovers(cw_cells, -20.5, -159.0));
+    try std.testing.expect(!try cellCovers(cw_cells, 0, 0));
+
+    // North Pole cap triangle: covers North Pole, NOT South Pole.
+    const polar = [_]LatLng{
+        .{ .lat = 80, .lng = 0 },
+        .{ .lat = 80, .lng = 120 },
+        .{ .lat = 80, .lng = -120 },
+    };
+    const polar_cells = try coverPolygon(&polar, opts, &out);
+    try std.testing.expect(try cellCovers(polar_cells, 89.9, 0));
+    try std.testing.expect(!try cellCovers(polar_cells, -89.9, 0));
+
+    // Concave L-shape: covers both arms, excludes notch and antipode.
+    const l_shape = [_]LatLng{
+        .{ .lat = 10, .lng = 10 },
+        .{ .lat = 10, .lng = 14 },
+        .{ .lat = 11, .lng = 14 },
+        .{ .lat = 11, .lng = 11 },
+        .{ .lat = 14, .lng = 11 },
+        .{ .lat = 14, .lng = 10 },
+    };
+    const l_cells = try coverPolygon(&l_shape, .{ .max_level = 12, .max_cells = 64 }, &out);
+    try std.testing.expect(try cellCovers(l_cells, 10.5, 13.0));
+    try std.testing.expect(try cellCovers(l_cells, 13.0, 10.5));
+    try std.testing.expect(!try cellCovers(l_cells, 13.0, 13.0));
+    try std.testing.expect(!try cellCovers(l_cells, -10.5, -167.0));
+}
+
+test "covering validates lat/lng even for whole-sphere radius" {
+    var ranges: [9]Range = undefined;
+    try std.testing.expectError(error.LatitudeOutOfRange, covering(91, 0, earth_radius_m * 4, &ranges));
+    try std.testing.expectError(error.LatitudeOutOfRange, covering(-91, 0, earth_radius_m * 4, &ranges));
+    try std.testing.expectError(error.NonFinite, covering(std.math.nan(f64), 0, earth_radius_m * 4, &ranges));
+    try std.testing.expectError(error.NonFinite, covering(0, std.math.inf(f64), earth_radius_m * 4, &ranges));
+}
+
+test "mergeRanges rejects unsorted input and merges nested cells cleanly" {
+    var ranges: [4]Range = undefined;
+    try std.testing.expectError(error.UnsortedCells, mergeRanges(&.{ Cell.fromFace(5), Cell.fromFace(0) }, &ranges));
+    const f0 = Cell.fromFace(0);
+    try std.testing.expectError(error.UnsortedCells, mergeRanges(&.{ f0.child(2), f0.child(1) }, &ranges));
+
+    // Sorted by id: child(1).id < parent.id, and parent subsumes child(1).
+    const nested = try mergeRanges(&.{ f0.child(1), f0 }, &ranges);
+    try std.testing.expectEqual(@as(usize, 1), nested.len);
+    try std.testing.expectEqual(f0.range(), nested[0]);
+}
+
+test "Cell.child and Cell.center avoid signed overflow on high faces and corners" {
+    for ([_]u3{ 4, 5 }) |f| {
+        const root = Cell.fromFace(f);
+        for (0..4) |pos_| {
+            const c = root.child(@intCast(pos_));
+            try std.testing.expect(c.valid() and c.face() == f and c.level() == 1);
+        }
+    }
+    // Malformed high-bit id must not trigger signed i64 overflow.
+    _ = (Cell{ .id = 0x8000_0000_0000_0000 }).child(0);
+
+    // Top-right corner at level 29 and 30 across all faces must not overflow i32 in center().
+    const max_ij: u32 = (1 << max_level) - 1;
+    for (0..6) |f| {
+        const corner_leaf = Cell.fromFaceIJ(@intCast(f), max_ij, max_ij);
+        const c30 = corner_leaf.center();
+        const c29 = corner_leaf.parent(29).center();
+        try std.testing.expect(std.math.isFinite(c30.lat) and std.math.isFinite(c30.lng));
+        try std.testing.expect(std.math.isFinite(c29.lat) and std.math.isFinite(c29.lng));
+    }
 }

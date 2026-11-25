@@ -6,6 +6,7 @@ const std = @import("std");
 /// Hilbert index of `(x, y)` on a `2^bits` by `2^bits` grid, processing one
 /// bit level per iteration (the classic `xy2d` formulation).
 pub fn encode2(bits: u6, x: u32, y: u32) u64 {
+    std.debug.assert(bits >= 1 and bits <= 32);
     const n: u64 = @as(u64, 1) << bits;
     var px: u64 = x;
     var py: u64 = y;
@@ -30,6 +31,7 @@ pub fn encode2(bits: u6, x: u32, y: u32) u64 {
 
 /// Inverse of `encode2`.
 pub fn decode2(bits: u6, index: u64) [2]u32 {
+    std.debug.assert(bits >= 1 and bits <= 32);
     const n: u64 = @as(u64, 1) << bits;
     var px: u64 = 0;
     var py: u64 = 0;
@@ -131,6 +133,15 @@ pub fn decodeNd(bits: u8, index: u128, out: []u32) void {
         }
     }
     for (x, out) |v, *o| o.* = @intCast(v);
+}
+
+test "reference 2D round-trips at boundary orders 1 and 32" {
+    for ([_]u6{ 1, 32 }) |bits| {
+        const hi: u32 = if (bits == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(bits)) - 1;
+        for ([_]u32{ 0, hi }) |x| for ([_]u32{ 0, hi }) |y| {
+            try std.testing.expectEqual([2]u32{ x, y }, decode2(bits, encode2(bits, x, y)));
+        };
+    }
 }
 
 test "reference n-D round-trips" {
